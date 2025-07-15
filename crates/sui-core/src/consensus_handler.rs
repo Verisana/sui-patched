@@ -1602,7 +1602,7 @@ mod tests {
             let digest = t.digest();
             if let Ok(Ok(_)) = tokio::time::timeout(
                 std::time::Duration::from_secs(10),
-                state.notify_read_effects(*digest),
+                state.notify_read_effects("", *digest),
             )
             .await
             {
@@ -1617,7 +1617,7 @@ mod tests {
             let digest = t.digest();
             if let Ok(Ok(_)) = tokio::time::timeout(
                 std::time::Duration::from_secs(10),
-                state.notify_read_effects(*digest),
+                state.notify_read_effects("", *digest),
             )
             .await
             {

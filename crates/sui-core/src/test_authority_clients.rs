@@ -290,7 +290,7 @@ impl LocalAuthorityClient {
                     )],
                     &epoch_store,
                 );
-                let effects = state.notify_read_effects(*certificate.digest()).await?;
+                let effects = state.notify_read_effects("", *certificate.digest()).await?;
                 state.sign_effects(effects, &epoch_store)?
             }
         }
