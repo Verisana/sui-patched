@@ -3832,11 +3832,12 @@ impl ProtocolConfig {
                                 default_none_duration_for_new_keys: true,
                             },
                         );
+                }
+                89 => {
                     if chain != Chain::Mainnet && chain != Chain::Testnet {
                         cfg.feature_flags.enable_coin_registry = true;
                     }
                 }
-                89 => {}
                 // Use this template when making changes:
                 //
                 //     // modify an existing constant.
