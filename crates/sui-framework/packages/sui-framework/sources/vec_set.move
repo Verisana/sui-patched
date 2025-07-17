@@ -46,6 +46,8 @@ public fun contains<K: copy + drop>(self: &VecSet<K>, key: &K): bool {
     get_idx_opt(self, key).is_some()
 }
 
+public use fun size as VecSet.length;
+
 /// Return the number of entries in `self`
 public fun size<K: copy + drop>(self: &VecSet<K>): u64 {
     self.contents.length()
