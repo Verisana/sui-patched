@@ -239,9 +239,94 @@ impl TryFrom<RField> for ExternalDependency {
 mod tests {
     use insta::assert_snapshot;
 
-    use crate::schema::ImplicitDepMode;
+    use crate::schema::{ImplicitDepMode, LocalDepInfo, OnChainDepInfo};
 
-    use super::ParsedManifest;
+    use super::{
+        DefaultDependency, ExternalDependency, ManifestDependencyInfo, ManifestGitDependency,
+        ParsedManifest, ReplacementDependency,
+    };
+
+    impl ParsedManifest {
+        /// (unsafe) convenience method for pulling out a dependency having given `name`
+        fn get_dep(&self, name: impl AsRef<str>) -> &DefaultDependency {
+            self.dependencies
+                .iter()
+                .find(|(dep_name, dep)| dep_name.as_ref().as_str() == name.as_ref())
+                .unwrap()
+                .1
+        }
+
+        /// (unsafe) convenience method for pulling out a dep-replacement for `env` having given `name`
+        fn get_replacement_dep(
+            &self,
+            env: impl AsRef<str>,
+            name: impl AsRef<str>,
+        ) -> &ReplacementDependency {
+            self.dep_replacements
+                .get(env.as_ref())
+                .expect("environment exists")
+                .iter()
+                .find(|(dep_name, dep)| dep_name.as_ref().as_str() == name.as_ref())
+                .unwrap()
+                .1
+                .as_ref()
+        }
+    }
+
+    /// (unsafe) convenience method for casting to particular dependency types
+    impl ManifestDependencyInfo {
+        fn as_external(&self) -> &ExternalDependency {
+            let Self::External(ext) = self else {
+                panic!("expected external dependency")
+            };
+            ext
+        }
+
+        fn as_local(&self) -> &LocalDepInfo {
+            let Self::Local(loc) = self else {
+                panic!("expected local dependency")
+            };
+            loc
+        }
+
+        fn as_git(&self) -> &ManifestGitDependency {
+            let Self::Git(git) = self else {
+                panic!("expected git dependency")
+            };
+            git
+        }
+
+        fn as_onchain(&self) -> &OnChainDepInfo {
+            let Self::OnChain(onchain) = self else {
+                panic!("expected onchain dependency")
+            };
+            onchain
+        }
+    }
+
+    /// Parsing with an external resolver works as expected
+    #[test]
+    fn parse_basic_external_resolver() {
+        let manifest: ParsedManifest = toml_edit::de::from_str(
+            r#"
+            [package]
+            name = "test"
+            edition = "2024"
+
+            [dependencies]
+            mock = { r.mock-resolver = { resolved = { local = "."} } }
+            "#,
+        )
+        .unwrap();
+
+        let dep = manifest.get_dep("mock").dependency_info.as_external();
+
+        assert_eq!(dep.resolver, "mock-resolver");
+        assert_eq!(
+            dep.data,
+            toml_edit::de::from_str(r#"resolved = { local = "." }"#).unwrap()
+        );
+    }
 
     /// The default value for `implicit-deps` is `true`
     #[test]
@@ -309,6 +394,31 @@ mod tests {
         5 |             implicit-deps = "bogus"
           |                             ^^^^^^^
         the only valid value for `implicit-deps` is `implicit-deps = false`
+        "###);
+    }
+
+    /// You can't have a git dep without `git`
+    #[test]
+    fn parse_missing_git_dep() {
+        let error = toml_edit::de::from_str::<ParsedManifest>(
+            r#"
+            [package]
+            name = "test"
+            edition = "2025"
+
+            [dependencies]
+            foo = { rename-from = "Foo", override = true, rev = "releases/v1" }
+            "#,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert_snapshot!(error, @r###"
+        TOML parse error at line 7, column 19
+          |
+        7 |             foo = { rename-from = "Foo", override = true, rev = "releases/v1" }
+          |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        Invalid dependency; dependencies must have exactly one of the following fields: `git`, `r.<resolver>`, `local`, or `on-chain`.
         "###);
     }
 }
