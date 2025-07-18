@@ -686,7 +686,7 @@ mod tests {
         assert_snapshot!(error, @r###"
         TOML parse error at line 1, column 1
           |
-        1 | 
+        1 |
           | ^
         missing field `package`
         "###);
@@ -940,7 +940,7 @@ mod tests {
 
     // Unsorted tests ////////////////////////////////////////////////////////////////////
 
-    ///
+    /// `local` field must be a path
     #[test]
     fn parse_local_integer_path() {
         let error = toml_edit::de::from_str::<ParsedManifest>(
@@ -962,6 +962,31 @@ mod tests {
         7 |             a = { local = 1 }
           |                 ^^^^^^^^^^^^^
         invalid type: integer `1`, expected path string for key `local`
+        "###);
+    }
+
+    /// [addresses] is dead ♥
+    #[test]
+    fn parse_addresses_section() {
+        let error = toml_edit::de::from_str::<ParsedManifest>(
+            r#"
+            [package]
+            name = "test"
+            edition = "2024"
+
+            [addresses]
+            legacy = 0x0
+            "#,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert_snapshot!(error, @r###"
+        TOML parse error at line 6, column 14
+          |
+        6 |             [addresses]
+          |              ^^^^^^^^^
+        unknown field `addresses`, expected one of `package`, `environments`, `dependencies`, `dep-replacements`
         "###);
     }
 }
