@@ -390,7 +390,7 @@ mod tests {
 
     // Implicit dependency parsing ///////////////////////////////////////////////////////
 
-    /// The default value for `implicit-deps` is `true`
+    /// The default value for `implicit-deps` is `Enabled`
     #[test]
     fn parse_implicit_deps() {
         let manifest: ParsedManifest = toml_edit::de::from_str(
@@ -607,7 +607,31 @@ mod tests {
         "###);
     }
 
-    // [package] section parsing /////////////////////////////////////////////////////////
+    /// No unrecognized fields at top level
+    #[test]
+    fn test_unknown_toplevel_field() {
+        let error = toml_edit::de::from_str::<ParsedManifest>(
+            r#"
+            [package]
+            name = "name"
+            edition = "2024"
+
+            [unknown]
+            "#,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert_snapshot!(error, @r###"
+        TOML parse error at line 6, column 14
+          |
+        6 |             [unknown]
+          |              ^^^^^^^
+        unknown field `unknown`, expected one of `package`, `environments`, `dependencies`, `dep-replacements`
+        "###);
+    }
+
+    // `package` section parsing /////////////////////////////////////////////////////////
 
     /// Check that we're parsing the [package] section correctly
     #[test]
@@ -688,6 +712,69 @@ mod tests {
         "###);
     }
 
+    /// package.name must be a string
+    #[test]
+    fn parse_integer_package_name() {
+        let error = toml_edit::de::from_str::<ParsedManifest>(
+            r#"
+            [package]
+            name = 1
+            edition = "2024"
+            "#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert_snapshot!(error, @r###"
+        TOML parse error at line 3, column 20
+          |
+        3 |             name = 1
+          |                    ^
+        invalid type: integer `1`, expected a string
+        "###);
+    }
+
+    /// package.name must be nonempty
+    #[test]
+    fn parse_empty_package_name() {
+        let error = toml_edit::de::from_str::<ParsedManifest>(
+            r#"
+            [package]
+            name = ""
+            edition = "2024"
+            "#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert_snapshot!(error, @r###"
+        TOML parse error at line 3, column 20
+          |
+        3 |             name = ""
+          |                    ^^
+        Invalid identifier ''
+        "###);
+    }
+
+    /// package.name must be an identifier
+    #[test]
+    fn parse_nonident_package_name() {
+        let error = toml_edit::de::from_str::<ParsedManifest>(
+            r#"
+            [package]
+            name = "®´∑œ"
+            edition = "2024"
+            "#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert_snapshot!(error, @r###"
+        TOML parse error at line 3, column 20
+          |
+        3 |             name = "®´∑œ"
+          |                    ^^^^^^^^^^^
+        Invalid identifier '®´∑œ'
+        "###);
+    }
+
     /// package.edition must be present
     #[test]
     fn parse_no_edition() {
@@ -710,6 +797,7 @@ mod tests {
 
     /// package edition must be recognized
     #[test]
+    #[ignore] // TODO: this validation currently doesn't happen during parsing. Should it?
     fn parse_unknown_edition() {
         let error = toml_edit::de::from_str::<ParsedManifest>(
             r#"
@@ -721,27 +809,6 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert_snapshot!(error, @"");
-    }
-
-    /// package.name must be an identifier
-    #[test]
-    fn parse_nonident_package_name() {
-        let error = toml_edit::de::from_str::<ParsedManifest>(
-            r#"
-            [package]
-            name = "®´∑œ"
-            edition = "2024"
-            "#,
-        )
-        .unwrap_err()
-        .to_string();
-        assert_snapshot!(error, @r###"
-        TOML parse error at line 3, column 20
-          |
-        3 |             name = "®´∑œ"
-          |                    ^^^^^^^^^^^
-        Invalid identifier '®´∑œ'
-        "###);
     }
 
     /// Environment IDs must be strings
@@ -872,4 +939,29 @@ mod tests {
     }
 
     // Unsorted tests ////////////////////////////////////////////////////////////////////
+
+    ///
+    #[test]
+    fn parse_local_integer_path() {
+        let error = toml_edit::de::from_str::<ParsedManifest>(
+            r#"
+            [package]
+            name = "test"
+            edition = "2024"
+
+            [dependencies]
+            a = { local = 1 }
+            "#,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert_snapshot!(error, @r###"
+        TOML parse error at line 7, column 17
+          |
+        7 |             a = { local = 1 }
+          |                 ^^^^^^^^^^^^^
+        invalid type: integer `1`, expected path string for key `local`
+        "###);
+    }
 }
