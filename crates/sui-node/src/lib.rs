@@ -206,6 +206,7 @@ mod simulator {
         parse_jwks(
             sui_types::zk_login_util::DEFAULT_JWK_BYTES,
             &OIDCProvider::Twitch,
+            false,
         )
         .map_err(|_| SuiError::JWKRetrievalError)
     }
@@ -321,6 +322,7 @@ impl SuiNode {
             .map(|s| OIDCProvider::from_str(s).expect("Invalid provider string"))
             .collect::<Vec<_>>();
 
+        let error_on_invalid_jwk = epoch_store.protocol_config().error_on_invalid_jwk();
         let fetch_interval = Duration::from_secs(config.jwk_fetch_interval_seconds);
 
         info!(
@@ -391,7 +393,7 @@ impl SuiNode {
                     loop {
                         info!("fetching JWK for provider {:?}", p);
                         metrics.jwk_requests.with_label_values(&[&provider_str]).inc();
-                        match Self::fetch_jwks(authority, &p).await {
+                        match Self::fetch_jwks(authority, &p, error_on_invalid_jwk).await {
                             Err(e) => {
                                 metrics.jwk_request_errors.with_label_values(&[&provider_str]).inc();
                                 warn!("Error when fetching JWK for provider {:?} {:?}", p, e);
@@ -2101,10 +2103,11 @@ impl SuiNode {
     async fn fetch_jwks(
         _authority: AuthorityName,
         provider: &OIDCProvider,
+        error_on_invalid_jwk: bool,
     ) -> SuiResult<Vec<(JwkId, JWK)>> {
         use fastcrypto_zkp::bn254::zk_login::fetch_jwks;
         let client = reqwest::Client::new();
-        fetch_jwks(provider, &client)
+        fetch_jwks(provider, &client, error_on_invalid_jwk)
             .await
             .map_err(|_| SuiError::JWKRetrievalError)
     }
@@ -2127,6 +2130,7 @@ impl SuiNode {
     async fn fetch_jwks(
         authority: AuthorityName,
         provider: &OIDCProvider,
+        error_on_invalid_jwk: bool,
     ) -> SuiResult<Vec<(JwkId, JWK)>> {
         get_jwk_injector()(authority, provider)
     }

@@ -744,6 +744,14 @@ struct FeatureFlags {
     // protocol versions (see make_vec_non_existent_type_v71.move)
     #[serde(skip_serializing_if = "is_false")]
     debug_fatal_on_move_invariant_violation: bool,
+
+    // If false, do not error but to skip invalid jwks. Legacy is true, the latest is false.
+    #[serde(skip_serializing_if = "is_true")]
+    error_on_invalid_jwk: bool,
+}
+
+fn is_true(b: &bool) -> bool {
+    *b
 }
 
 fn is_false(b: &bool) -> bool {
@@ -2112,6 +2120,10 @@ impl ProtocolConfig {
 
     pub fn debug_fatal_on_move_invariant_violation(&self) -> bool {
         self.feature_flags.debug_fatal_on_move_invariant_violation
+    }
+
+    pub fn error_on_invalid_jwk(&self) -> bool {
+        self.feature_flags.error_on_invalid_jwk
     }
 }
 
@@ -3839,6 +3851,7 @@ impl ProtocolConfig {
                 }
                 89 => {
                     cfg.feature_flags.debug_fatal_on_move_invariant_violation = true;
+                    cfg.feature_flags.error_on_invalid_jwk = false;
                 }
                 // Use this template when making changes:
                 //
