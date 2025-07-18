@@ -486,6 +486,30 @@ mod tests {
         "###);
     }
 
+    #[test]
+    fn parse_empty_dep() {
+        let error = toml_edit::de::from_str::<ParsedManifest>(
+            r#"
+            [package]
+            name = "test"
+            edition = "2024"
+
+            [dependencies]
+            foo = {}
+            "#,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert_snapshot!(error, @r###"
+        TOML parse error at line 7, column 19
+          |
+        7 |             foo = {}
+          |                   ^^
+        Invalid dependency; dependencies must have exactly one of the following fields: `git`, `r.<resolver>`, `local`, or `on-chain`.
+        "###);
+    }
+
     /// You can override the complete dependency location information (e.g. a new `git` field) in a
     /// `dep-replacement`
     #[test]
@@ -623,6 +647,25 @@ mod tests {
     fn parse_unrecognized_package_fields() {
         // TODO: we're not actually producing these warnings!
         todo!()
+    }
+
+    /// [package] must be present
+    #[test]
+    fn parse_no_package_section() {
+        let error = toml_edit::de::from_str::<ParsedManifest>(
+            r#"
+            [dependencies]
+            "#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert_snapshot!(error, @r###"
+        TOML parse error at line 1, column 1
+          |
+        1 | 
+          | ^
+        missing field `package`
+        "###);
     }
 
     /// package.name must be present
