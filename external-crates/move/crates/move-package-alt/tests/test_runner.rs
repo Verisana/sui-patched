@@ -13,7 +13,7 @@ use move_package_alt::{
     package::{RootPackage, lockfile::Lockfiles, manifest::Manifest, paths::PackagePath},
 };
 use std::path::Path;
-use tracing::debug;
+use tracing::{debug, info};
 use tracing_subscriber::EnvFilter;
 
 /// Resolve the package contained in the same directory as [path], and snapshot a value based
@@ -69,6 +69,9 @@ impl Test<'_> {
     fn output(&self) -> anyhow::Result<String> {
         Ok(match self.kind {
             "parsed" => {
+                info!(
+                    ".parsed snapshot tests are deprecated; they should be migrated to schema::manifest::test"
+                );
                 let manifest = Manifest::<Vanilla>::read_from_file(self.toml_path);
                 let contents = match manifest.as_ref() {
                     Ok(m) => format!("{:#?}", m),
@@ -94,6 +97,9 @@ impl Test<'_> {
             "locked" => {
                 // TODO: this needs to deal with ephemeral environments
 
+                info!(
+                    ".locked snapshot tests are deprecated; they should be migrated to schema::lockfile::test"
+                );
                 let dir = PackagePath::new(self.toml_path.parent().unwrap().to_path_buf()).unwrap();
 
                 let lockfile = Lockfiles::<Vanilla>::read_from_dir(&dir);
