@@ -31,8 +31,7 @@ use vfs::{
 
 use move_command_line_common::files::FileHash;
 use move_compiler::{
-    PASS_CFGIR, PASS_PARSER, PASS_TYPING, PreCompiledModuleInfoMap,
-    construct_precompiled_module_info,
+    PASS_CFGIR, PASS_PARSER, PASS_TYPING, PreCompiledProgramInfo, construct_pre_compiled_lib,
     editions::{Edition, Flavor},
     expansion::ast::ModuleIdent,
     linters::LintLevel,
@@ -89,7 +88,7 @@ pub struct PrecomputedPkgInfo {
     /// Hash of dependency source files
     pub deps_hash: String,
     /// Precompiled deps
-    pub deps: Arc<PreCompiledModuleInfoMap>,
+    pub deps: Arc<PreCompiledProgramInfo>,
     /// Symbols computation data
     pub deps_symbols_data: Arc<SymbolsComputationData>,
     /// Compiled user program
@@ -110,7 +109,7 @@ pub struct PrecomputedPkgInfo {
 #[derive(Clone)]
 pub struct AnalyzedPkgInfo {
     /// Cached fully compiled program representing dependencies
-    pub program_deps: Arc<PreCompiledModuleInfoMap>,
+    pub program_deps: Arc<PreCompiledProgramInfo>,
     /// Cached symbols computation data for dependencies
     pub symbols_data: Option<Arc<SymbolsComputationData>>,
     /// Compiled user program
@@ -267,7 +266,7 @@ pub fn get_compiled_pkg(
                         )
                     }
                     _ => (
-                        construct_precompiled_module_info(
+                        construct_pre_compiled_lib(
                             src_deps,
                             None,
                             compiler_flags,
@@ -345,7 +344,7 @@ pub fn get_compiled_pkg(
                 let compiler = compiler.set_ide_mode();
                 // extract expansion AST
                 let (files, compilation_result) = compiler
-                    .set_pre_compiled_module_info_opt(compiled_libs)
+                    .set_pre_compiled_program_opt(compiled_libs)
                     .set_files_to_compile(if full_compilation {
                         None
                     } else {
