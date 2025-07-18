@@ -3824,6 +3824,8 @@ impl ProtocolConfig {
                                 default_none_duration_for_new_keys: true,
                             },
                         );
+                    cfg.feature_flags.accept_passkey_in_multisig = true;
+                    cfg.feature_flags.passkey_auth = true;
                 }
                 // Use this template when making changes:
                 //
