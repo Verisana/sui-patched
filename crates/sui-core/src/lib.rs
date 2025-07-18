@@ -36,6 +36,7 @@ pub mod rpc_index;
 pub mod safe_client;
 mod scoring_decision;
 mod stake_aggregator;
+mod status_aggregator;
 pub mod storage;
 pub mod streamer;
 pub mod subscription_handler;
