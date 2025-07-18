@@ -43,6 +43,9 @@ pub struct PackageMetadata {
 
     #[serde(default)]
     pub implicit_deps: ImplicitDepMode,
+
+    #[serde(flatten)]
+    pub unrecognized_fields: BTreeMap<String, toml::Value>,
 }
 
 /// The `implicit-deps` field of a manifest
@@ -237,7 +240,7 @@ impl TryFrom<RField> for ExternalDependency {
 
 #[cfg(test)]
 mod tests {
-    use insta::assert_snapshot;
+    use insta::{assert_debug_snapshot, assert_snapshot};
 
     use crate::schema::{ImplicitDepMode, LocalDepInfo, OnChainDepInfo};
 
@@ -550,6 +553,41 @@ mod tests {
           |             ^
         invalid table header
         duplicate key `package` in document root
+        "###);
+    }
+
+    #[test]
+    fn test_all_package_fields() {
+        let manifest: ParsedManifest = toml_edit::de::from_str(
+            r#"
+            [package]
+            # non-ignored fields
+            name = "name"
+            edition = "2024"
+
+            # ignored fields
+            flavor = "core"
+            license = "license"
+            authors = ["some author"]
+            other_fields = "fine"
+
+            [environments]
+            mainnet = "35834a8a"
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(manifest.package.name.as_ref().as_str(), "name");
+        assert_eq!(manifest.package.edition, "2024");
+
+        let unrecognized: Vec<_> = manifest.package.unrecognized_fields.keys().collect();
+        assert_debug_snapshot!(unrecognized, @r###"
+        [
+            "authors",
+            "flavor",
+            "license",
+            "other_fields",
+        ]
         "###);
     }
 }
