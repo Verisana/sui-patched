@@ -314,6 +314,42 @@ mod tests {
         }
     }
 
+    // Smoke tests ///////////////////////////////////////////////////////////////////////
+
+    /// Parsing a basic file using a number of features succeeds
+    #[test]
+    fn basic() {
+        let manifest: ParsedManifest = toml_edit::de::from_str(
+            r#"
+            [package]
+            name = "example"
+            edition = "2024"
+            license = "Apache-2.0"
+            authors = ["Move Team"]
+            flavor = "vanilla"
+
+            [environments]
+            mainnet = "35834a8a"
+            testnet = "4c78adac"
+
+            [dependencies]
+            foo = { git = "https://example.com/foo.git", rev = "releases/v1", rename-from = "Foo", override = true}
+            qwer = { r.mvr = "@pkg/qwer" }
+
+            [dep-replacements]
+            # used to replace dependencies for specific environments
+            mainnet.foo = { git = "https://example.com/foo.git", original-id = "0x6ba0cc1a418ff3bebce0ff9ec3961e6cc794af9bc3a4114fb138d00a4c9274bb", published-at = "0x6ba0cc1a418ff3bebce0ff9ec3961e6cc794af9bc3a4114fb138d00a4c9274bb", use-environment = "mainnet_alpha" }
+
+            [dep-replacements.mainnet.bar]
+            git = "https://example.com/bar.git"
+            original-id = "0x10775b77a3deea86dd3b4a1dbebd18736f85677535e86db56cdb40c52778da5b"
+            published-at = "0x10775b77a3deea86dd3b4a1dbebd18736f85677535e86db56cdb40c52778da5b"
+            use-environment = "mainnet_beta"
+            "#,
+        )
+        .unwrap();
+    }
+
     // External resolver formatting //////////////////////////////////////////////////////
 
     /// Parsing with an external resolver works as expected
@@ -686,7 +722,7 @@ mod tests {
         assert_snapshot!(error, @r###"
         TOML parse error at line 1, column 1
           |
-        1 |
+        1 | 
           | ^
         missing field `package`
         "###);
