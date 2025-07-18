@@ -257,7 +257,7 @@ mod tests {
         }
 
         /// (unsafe) convenience method for pulling out a dep-replacement for `env` having given `name`
-        fn get_replacement_dep(
+        fn get_replacement(
             &self,
             env: impl AsRef<str>,
             name: impl AsRef<str>,
@@ -273,7 +273,7 @@ mod tests {
         }
     }
 
-    /// (unsafe) convenience method for casting to particular dependency types
+    /// (unsafe) convenience methods for casting to particular dependency types
     impl ManifestDependencyInfo {
         fn as_external(&self) -> &ExternalDependency {
             let Self::External(ext) = self else {
@@ -304,6 +304,15 @@ mod tests {
         }
     }
 
+    impl ReplacementDependency {
+        /// (unsafe) convenience method for unwrapping the dependency info
+        fn info(&self) -> &ManifestDependencyInfo {
+            &self.dependency.as_ref().unwrap().dependency_info
+        }
+    }
+
+    // External resolver formatting //////////////////////////////////////////////////////
+
     /// Parsing with an external resolver works as expected
     #[test]
     fn parse_basic_external_resolver() {
@@ -327,6 +336,8 @@ mod tests {
             toml_edit::de::from_str(r#"resolved = { local = "." }"#).unwrap()
         );
     }
+
+    // Implicit dependency parsing ///////////////////////////////////////////////////////
 
     /// The default value for `implicit-deps` is `true`
     #[test]
@@ -397,14 +408,16 @@ mod tests {
         "###);
     }
 
-    /// You can't have a git dep without `git`
+    // Dependency and dep-replacement parsing ////////////////////////////////////////////
+
+    /// You need the `git` field to have a git dependency
     #[test]
-    fn parse_missing_git_dep() {
+    fn parse_incomplete_dep() {
         let error = toml_edit::de::from_str::<ParsedManifest>(
             r#"
             [package]
             name = "test"
-            edition = "2025"
+            edition = "2024"
 
             [dependencies]
             foo = { rename-from = "Foo", override = true, rev = "releases/v1" }
@@ -419,6 +432,124 @@ mod tests {
         7 |             foo = { rename-from = "Foo", override = true, rev = "releases/v1" }
           |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
         Invalid dependency; dependencies must have exactly one of the following fields: `git`, `r.<resolver>`, `local`, or `on-chain`.
+        "###);
+    }
+
+    /// You can override the complete dependency location information (e.g. a new `git` field) in a
+    /// `dep-replacement`
+    #[test]
+    fn parse_git_override() {
+        let manifest: ParsedManifest = toml_edit::de::from_str(
+            r#"
+            [package]
+            name = "test"
+            edition = "2024"
+
+            [dependencies]
+            foo = { git = "foo-default.git", rev = "1234" }
+
+            [dep-replacements]
+            # Note: the combined dep here should have no revision; the entire dep is overridden
+            mainnet.foo = { git = "foo-replacement.git" }
+            "#,
+        )
+        .unwrap();
+
+        let dep = manifest.get_dep("foo").dependency_info.as_git();
+        let replacement = manifest.get_replacement("mainnet", "foo").info().as_git();
+
+        assert_eq!(dep.repo, "foo-default.git");
+        assert_eq!(dep.rev, Some("1234".into()));
+
+        assert_eq!(replacement.repo, "foo-replacement.git");
+        assert_eq!(replacement.rev, None);
+    }
+
+    /// You can't add partial dependency information (e.g. just updating the `rev` field) in a
+    /// `dep-replacement`
+    #[test]
+    #[ignore] // TODO: this test is currently failing because the extra stuff just gets dropped
+    fn parse_git_partial_replacement() {
+        let error = toml_edit::de::from_str::<ParsedManifest>(
+            r#"
+            [package]
+            name = "test"
+            edition = "2024"
+
+            [dep-replacements]
+            mainnet.foo = { rev = "foo-replacement.git" }
+        "#,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert_snapshot!(error, @"TODO");
+    }
+
+    /// If overriding the address of a dependency, you can't just provide the published-at
+    #[test]
+    #[ignore] // TODO: this test is currently failing because the extra stuff just gets dropped
+    fn parse_published_at_without_original_id() {
+        let error = toml_edit::de::from_str::<ParsedManifest>(
+            r#"
+            [package]
+            name = "test"
+            edition = "2024"
+
+            [dep-replacements]
+            mainnet.foo = { published-at = "1234" }
+            "#,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert_snapshot!(error, @"TODO");
+    }
+
+    /// If overriding the address of a dependency, you can't just provide the original-id
+    #[test]
+    #[ignore] // TODO: this test is currently failing because the extra stuff just gets dropped
+    fn parse_original_id_without_published_at() {
+        let error = toml_edit::de::from_str::<ParsedManifest>(
+            r#"
+            [package]
+            name = "test"
+            edition = "2024"
+
+            [dep-replacements]
+            mainnet.foo = { original-id = "1234" }
+            "#,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert_snapshot!(error, @"TODO");
+    }
+
+    // Basic TOML error messages /////////////////////////////////////////////////////////
+
+    /// Duplicate top level fields can't be repeated
+    #[test]
+    fn parse_duplicate_top_level_field() {
+        let error = toml_edit::de::from_str::<ParsedManifest>(
+            r#"
+            [package]
+            name = "name"
+            edition = "2025"
+
+            [package]
+            "#,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert_snapshot!(error, @r###"
+        TOML parse error at line 6, column 13
+          |
+        6 |             [package]
+          |             ^
+        invalid table header
+        duplicate key `package` in document root
         "###);
     }
 }
