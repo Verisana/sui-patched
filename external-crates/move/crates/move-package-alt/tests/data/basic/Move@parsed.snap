@@ -11,6 +11,21 @@ ParsedManifest {
         },
         edition: "2025",
         implicit_deps: Enabled,
+        unrecognized_fields: {
+            "authors": Array(
+                [
+                    String(
+                        "Move Team",
+                    ),
+                ],
+            ),
+            "flavor": String(
+                "vanilla",
+            ),
+            "license": String(
+                "Apache-2.0",
+            ),
+        },
     },
     environments: {
         Spanned {

@@ -11,6 +11,15 @@ ParsedManifest {
         },
         edition: "2025",
         implicit_deps: Enabled,
+        unrecognized_fields: {
+            "authors": Array(
+                [
+                    Integer(
+                        1,
+                    ),
+                ],
+            ),
+        },
     },
     environments: {
         Spanned {

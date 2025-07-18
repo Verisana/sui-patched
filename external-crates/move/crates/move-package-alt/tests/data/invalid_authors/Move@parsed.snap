@@ -11,6 +11,11 @@ ParsedManifest {
         },
         edition: "2025",
         implicit_deps: Enabled,
+        unrecognized_fields: {
+            "authors": String(
+                "nope",
+            ),
+        },
     },
     environments: {
         Spanned {
