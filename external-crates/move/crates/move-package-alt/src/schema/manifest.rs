@@ -240,7 +240,7 @@ impl TryFrom<RField> for ExternalDependency {
 
 #[cfg(test)]
 mod tests {
-    use insta::{assert_debug_snapshot, assert_snapshot};
+    use insta::assert_snapshot;
 
     use crate::schema::{ImplicitDepMode, LocalDepInfo, OnChainDepInfo};
 
@@ -338,6 +338,54 @@ mod tests {
             dep.data,
             toml_edit::de::from_str(r#"resolved = { local = "." }"#).unwrap()
         );
+    }
+
+    /// You can only have one external resolver
+    #[test]
+    fn parse_multiple_external_resolvers() {
+        let error = toml_edit::de::from_str::<ParsedManifest>(
+            r#"
+            [package]
+            name = "test"
+            edition = "2024"
+
+            [dependencies]
+            foo = { r.mvr = "a", r.ext = "b" }
+            "#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert_snapshot!(error, @r###"
+        TOML parse error at line 7, column 19
+          |
+        7 |             foo = { r.mvr = "a", r.ext = "b" }
+          |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        Externally resolved dependencies may only have one `r.<resolver>` field
+        "###);
+    }
+
+    /// `r` fields (for external deps) must be objects
+    #[test]
+    fn parse_nonobject_external() {
+        let error = toml_edit::de::from_str::<ParsedManifest>(
+            r#"
+            [package]
+            name = "test"
+            edition = "2024"
+
+            [dependencies]
+            foo = { r = 0 }
+            "#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert_snapshot!(error, @r###"
+        TOML parse error at line 7, column 19
+          |
+        7 |             foo = { r = 0 }
+          |                   ^^^^^^^^^
+        invalid type: integer `0`, expected a map for key `r`
+        "###);
     }
 
     // Implicit dependency parsing ///////////////////////////////////////////////////////
@@ -468,27 +516,6 @@ mod tests {
         assert_eq!(replacement.rev, None);
     }
 
-    /// You can't add partial dependency information (e.g. just updating the `rev` field) in a
-    /// `dep-replacement`
-    #[test]
-    #[ignore] // TODO: this test is currently failing because the extra stuff just gets dropped
-    fn parse_git_partial_replacement() {
-        let error = toml_edit::de::from_str::<ParsedManifest>(
-            r#"
-            [package]
-            name = "test"
-            edition = "2024"
-
-            [dep-replacements]
-            mainnet.foo = { rev = "foo-replacement.git" }
-        "#,
-        )
-        .unwrap_err()
-        .to_string();
-
-        assert_snapshot!(error, @"TODO");
-    }
-
     /// If overriding the address of a dependency, you can't just provide the published-at
     #[test]
     #[ignore] // TODO: this test is currently failing because the extra stuff just gets dropped
@@ -531,7 +558,7 @@ mod tests {
 
     // Basic TOML error messages /////////////////////////////////////////////////////////
 
-    /// Duplicate top level fields can't be repeated
+    /// Top level fields can't be repeated
     #[test]
     fn parse_duplicate_top_level_field() {
         let error = toml_edit::de::from_str::<ParsedManifest>(
@@ -556,6 +583,9 @@ mod tests {
         "###);
     }
 
+    // [package] section parsing /////////////////////////////////////////////////////////
+
+    /// Check that we're parsing the [package] section correctly
     #[test]
     fn test_all_package_fields() {
         let manifest: ParsedManifest = toml_edit::de::from_str(
@@ -580,14 +610,223 @@ mod tests {
         assert_eq!(manifest.package.name.as_ref().as_str(), "name");
         assert_eq!(manifest.package.edition, "2024");
 
-        let unrecognized: Vec<_> = manifest.package.unrecognized_fields.keys().collect();
-        assert_debug_snapshot!(unrecognized, @r###"
-        [
-            "authors",
-            "flavor",
-            "license",
-            "other_fields",
-        ]
+        let unrecognized = manifest.package.unrecognized_fields.keys();
+        assert_eq!(
+            unrecognized.collect::<Vec<_>>(),
+            ["authors", "flavor", "license", "other_fields"]
+        );
+    }
+
+    /// Unrecognized fields should produce warnings
+    #[test]
+    #[ignore] // TODO: we need a way to collect warnings in unit tests
+    fn parse_unrecognized_package_fields() {
+        // TODO: we're not actually producing these warnings!
+        todo!()
+    }
+
+    /// package.name must be present
+    #[test]
+    fn parse_no_package_name() {
+        let error = toml_edit::de::from_str::<ParsedManifest>(
+            r#"
+            [package]
+            edition = "2024"
+            "#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert_snapshot!(error, @r###"
+        TOML parse error at line 2, column 13
+          |
+        2 |             [package]
+          |             ^^^^^^^^^
+        missing field `name`
         "###);
     }
+
+    /// package.edition must be present
+    #[test]
+    fn parse_no_edition() {
+        let error = toml_edit::de::from_str::<ParsedManifest>(
+            r#"
+            [package]
+            name = "test"
+            "#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert_snapshot!(error, @r###"
+        TOML parse error at line 2, column 13
+          |
+        2 |             [package]
+          |             ^^^^^^^^^
+        missing field `edition`
+        "###);
+    }
+
+    /// package edition must be recognized
+    #[test]
+    fn parse_unknown_edition() {
+        let error = toml_edit::de::from_str::<ParsedManifest>(
+            r#"
+            [package]
+            name = "test"
+            edition = "unknown"
+            "#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert_snapshot!(error, @"");
+    }
+
+    /// package.name must be an identifier
+    #[test]
+    fn parse_nonident_package_name() {
+        let error = toml_edit::de::from_str::<ParsedManifest>(
+            r#"
+            [package]
+            name = "®´∑œ"
+            edition = "2024"
+            "#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert_snapshot!(error, @r###"
+        TOML parse error at line 3, column 20
+          |
+        3 |             name = "®´∑œ"
+          |                    ^^^^^^^^^^^
+        Invalid identifier '®´∑œ'
+        "###);
+    }
+
+    /// Environment IDs must be strings
+    #[test]
+    fn test_invalid_env_id() {
+        let error = toml_edit::de::from_str::<ParsedManifest>(
+            r#"
+            [package]
+            name = "name"
+            edition = "2024"
+
+            [environments]
+            mainnet = 1234
+            "#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert_snapshot!(error, @r###"
+        TOML parse error at line 7, column 23
+          |
+        7 |             mainnet = 1234
+          |                       ^^^^
+        invalid type: integer `1234`, expected a string
+        "###);
+    }
+
+    /// Rename-from must be a string
+    #[test]
+    fn test_invalid_rename_from() {
+        let error = toml_edit::de::from_str::<ParsedManifest>(
+            r#"
+            [package]
+            name = "name"
+            edition = "2024"
+
+            [dependencies]
+            a = { local = "a", rename-from = { "A" = "B" } }
+            "#,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert_snapshot!(error, @r###"
+        TOML parse error at line 7, column 46
+          |
+        7 |             a = { local = "a", rename-from = { "A" = "B" } }
+          |                                              ^^^^^^^^^^^^^
+        invalid type: map, expected a string
+        "###);
+    }
+
+    /// Rename-from must be a valid identifier
+    #[test]
+    fn test_nonident_rename_from() {
+        let error = toml_edit::de::from_str::<ParsedManifest>(
+            r#"
+            [package]
+            name = "name"
+            edition = "2024"
+
+            [dependencies]
+            a = { local = "a", rename-from = "0xff" }
+            "#,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert_snapshot!(error, @r###"
+        TOML parse error at line 7, column 46
+          |
+        7 |             a = { local = "a", rename-from = "0xff" }
+          |                                              ^^^^^^
+        Invalid identifier '0xff'
+        "###);
+    }
+
+    // Tests to remove? //////////////////////////////////////////////////////////////////
+
+    /// Authors must be an array
+    #[test]
+    #[ignore] // TODO: do we want to validate `authors` type? we currently don't
+    fn test_authors() {
+        let error = toml_edit::de::from_str::<ParsedManifest>(
+            r#"
+            [package]
+            name = "name"
+            edition = "2024"
+            authors = [1]
+            "#,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert_snapshot!(error, @"TODO");
+
+        let error = toml_edit::de::from_str::<ParsedManifest>(
+            r#"
+            [package]
+            name = "name"
+            edition = "2024"
+            authors = "me@mystenlabs.com"
+            "#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert_snapshot!(error, @"TODO");
+    }
+
+    /// You can't add partial dependency information (e.g. just updating the `rev` field) in a
+    /// `dep-replacement`
+    #[test]
+    #[ignore] // TODO: this test is currently failing because the extra stuff just gets dropped
+    fn parse_git_partial_replacement() {
+        let error = toml_edit::de::from_str::<ParsedManifest>(
+            r#"
+            [package]
+            name = "test"
+            edition = "2024"
+
+            [dep-replacements]
+            mainnet.foo = { rev = "foo-replacement.git" }
+        "#,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert_snapshot!(error, @"TODO");
+    }
+
+    // Unsorted tests ////////////////////////////////////////////////////////////////////
 }
