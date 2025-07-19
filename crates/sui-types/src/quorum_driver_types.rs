@@ -60,6 +60,8 @@ pub enum QuorumDriverError {
         errors: GroupedErrors,
         retry_after_secs: u64,
     },
+    #[error("QuorumDriver wrapped TransactionDriver error: {0}.")]
+    TransactionDriverError(String),
 }
 
 pub type GroupedErrors = Vec<(SuiError, StakeUnit, Vec<ConciseAuthorityPublicKeyBytes>)>;
