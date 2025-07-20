@@ -229,6 +229,7 @@ pub mod authority_per_epoch_store_pruner;
 
 mod authority_store_migrations;
 pub mod authority_store_pruner;
+pub mod authority_store_readonly_tables;
 pub mod authority_store_tables;
 pub mod authority_store_types;
 pub mod consensus_tx_status_cache;
@@ -3043,7 +3044,7 @@ impl AuthorityState {
             &config.authority_store_pruning_config,
         );
         let _pruner = AuthorityStorePruner::new(
-            store.perpetual_tables.clone(),
+            store.perpetual_tables.inner().clone(),
             checkpoint_store.clone(),
             rpc_index.clone(),
             indexes.clone(),
@@ -3172,7 +3173,7 @@ impl AuthorityState {
         metrics: Arc<AuthorityStorePruningMetrics>,
     ) -> anyhow::Result<()> {
         AuthorityStorePruner::prune_checkpoints_for_eligible_epochs(
-            &self.database_for_testing().perpetual_tables,
+            &self.database_for_testing().perpetual_tables.inner(),
             &self.checkpoint_store,
             self.rpc_index.as_deref(),
             None,

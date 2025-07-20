@@ -12,13 +12,18 @@ pub async fn migrate_events(store: Arc<AuthorityStore>) {
     tracing::info!("Starting events table migration");
 
     let result = tokio::task::spawn_blocking(move || {
-        let mut batch = store.perpetual_tables.events_2.batch();
+        let mut batch = store.perpetual_tables.inner().events_2.batch();
 
-        for entry in store.perpetual_tables.executed_effects.safe_iter() {
+        for entry in store.perpetual_tables.inner().executed_effects.safe_iter() {
             let (txn_digest, effects_digest) = entry?;
 
             // If there's already an entry for this transaction in the new table we can skip it
-            if store.perpetual_tables.events_2.contains_key(&txn_digest)? {
+            if store
+                .perpetual_tables
+                .inner()
+                .events_2
+                .contains_key(&txn_digest)?
+            {
                 continue;
             }
 
@@ -55,12 +60,16 @@ pub async fn migrate_events(store: Arc<AuthorityStore>) {
                 continue;
             };
 
-            batch.insert_batch(&store.perpetual_tables.events_2, [(&txn_digest, &events)])?;
+            batch.insert_batch(
+                &store.perpetual_tables.inner().events_2,
+                [(&txn_digest, &events)],
+            )?;
 
             // If the batch size grows to greater that 128MB then write out to the DB so that the
             // data we need to hold in memory doesn't grown unbounded.
             if batch.size_in_bytes() >= 1 << 27 {
-                std::mem::replace(&mut batch, store.perpetual_tables.events_2.batch()).write()?;
+                std::mem::replace(&mut batch, store.perpetual_tables.inner().events_2.batch())
+                    .write()?;
             }
         }
 

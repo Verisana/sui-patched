@@ -14,6 +14,7 @@ use crate::authority::epoch_start_configuration::{EpochFlag, EpochStartConfigura
 use crate::global_state_hasher::GlobalStateHashStore;
 use crate::rpc_index::RpcIndexStore;
 use crate::transaction_outputs::TransactionOutputs;
+use authority_store_tables::AuthorityPerpetualTablesReadOnly;
 use either::Either;
 use fastcrypto::hash::{HashFunction, MultisetHash, Sha3_256};
 use futures::stream::FuturesUnordered;
@@ -43,7 +44,10 @@ use typed_store::{
 };
 
 use super::authority_store_tables::LiveObject;
-use super::{authority_store_tables::AuthorityPerpetualTables, *};
+use super::{
+    authority_store_readonly_tables::AuthorityPerpetualTablesMix,
+    authority_store_tables::AuthorityPerpetualTables, *,
+};
 use mysten_common::sync::notify_read::NotifyRead;
 use sui_types::effects::{TransactionEffects, TransactionEvents};
 use sui_types::gas_coin::TOTAL_SUPPLY_MIST;
@@ -113,7 +117,7 @@ pub struct AuthorityStore {
     /// Internal vector of locks to manage concurrent writes to the database
     mutex_table: MutexTable<ObjectDigest>,
 
-    pub(crate) perpetual_tables: Arc<AuthorityPerpetualTables>,
+    pub(crate) perpetual_tables: AuthorityPerpetualTablesMix,
 
     pub(crate) root_state_notify_read:
         NotifyRead<EpochId, (CheckpointSequenceNumber, GlobalStateHash)>,
@@ -204,10 +208,12 @@ impl AuthorityStore {
         // at epoch boundaries (during reconfiguration). Therefore any entries that currently
         // exist can be removed. Because of this we can use the `schedule_delete_all` method.
         self.perpetual_tables
+            .inner()
             .object_per_epoch_marker_table
             .schedule_delete_all()?;
         Ok(self
             .perpetual_tables
+            .inner()
             .object_per_epoch_marker_table_v2
             .schedule_delete_all()?)
     }
@@ -231,7 +237,7 @@ impl AuthorityStore {
     ) -> SuiResult<Arc<Self>> {
         let store = Arc::new(Self {
             mutex_table: MutexTable::new(NUM_SHARDS),
-            perpetual_tables,
+            perpetual_tables: AuthorityPerpetualTablesMix::Full(perpetual_tables),
             root_state_notify_read: NotifyRead::<
                 EpochId,
                 (CheckpointSequenceNumber, GlobalStateHash),
@@ -253,12 +259,14 @@ impl AuthorityStore {
 
             store
                 .perpetual_tables
+                .inner()
                 .transactions
                 .insert(transaction.digest(), transaction.serializable_ref())
                 .unwrap();
 
             store
                 .perpetual_tables
+                .inner()
                 .effects
                 .insert(&genesis.effects().digest(), genesis.effects())
                 .unwrap();
@@ -268,6 +276,7 @@ impl AuthorityStore {
             if genesis.effects().events_digest().is_some() {
                 store
                     .perpetual_tables
+                    .inner()
                     .events_2
                     .insert(transaction.digest(), genesis.events())
                     .unwrap();
@@ -279,9 +288,35 @@ impl AuthorityStore {
                 .iter()
                 .enumerate()
                 .map(|(i, e)| ((event_digests, i), e));
-            store.perpetual_tables.events.multi_insert(events).unwrap();
+            store
+                .perpetual_tables
+                .inner()
+                .events
+                .multi_insert(events)
+                .unwrap();
         }
 
+        Ok(store)
+    }
+
+    /// Open authority store without any operations that require
+    /// genesis, such as constructing EpochStartConfiguration
+    /// or inserting genesis objects.
+    pub fn open_readonly(
+        perpetual_tables: Arc<AuthorityPerpetualTablesReadOnly>,
+        enable_epoch_sui_conservation_check: bool,
+        registry: &Registry,
+    ) -> SuiResult<Arc<Self>> {
+        let store = Arc::new(Self {
+            mutex_table: MutexTable::new(NUM_SHARDS),
+            perpetual_tables: AuthorityPerpetualTablesMix::ReadOnly(perpetual_tables),
+            root_state_notify_read: NotifyRead::<
+                EpochId,
+                (CheckpointSequenceNumber, GlobalStateHash),
+            >::new(),
+            enable_epoch_sui_conservation_check,
+            metrics: AuthorityStoreMetrics::new(registry),
+        });
         Ok(store)
     }
 
@@ -295,7 +330,7 @@ impl AuthorityStore {
     ) -> SuiResult<Arc<Self>> {
         let store = Arc::new(Self {
             mutex_table: MutexTable::new(NUM_SHARDS),
-            perpetual_tables,
+            perpetual_tables: AuthorityPerpetualTablesMix::Full(perpetual_tables),
             root_state_notify_read: NotifyRead::<
                 EpochId,
                 (CheckpointSequenceNumber, GlobalStateHash),
@@ -314,13 +349,13 @@ impl AuthorityStore {
         &self,
         effects_digest: &TransactionEffectsDigest,
     ) -> SuiResult<Option<TransactionEffects>> {
-        Ok(self.perpetual_tables.effects.get(effects_digest)?)
+        Ok(self.perpetual_tables.effects().get(effects_digest)?)
     }
 
     /// Returns true if we have an effects structure for this transaction digest
     pub fn effects_exists(&self, effects_digest: &TransactionEffectsDigest) -> SuiResult<bool> {
         self.perpetual_tables
-            .effects
+            .effects()
             .contains_key(effects_digest)
             .map_err(|e| e.into())
     }
@@ -332,7 +367,7 @@ impl AuthorityStore {
         // For now, during this transition period, if we don't find events for a particular
         // Transaction we need to fallback to try and read from the older table. Once the migration
         // has finished and we've removed the older events table we can stop doing the fallback
-        if let Some(events) = self.perpetual_tables.events_2.get(digest)? {
+        if let Some(events) = self.perpetual_tables.events_2().get(digest)? {
             return Ok(Some(events));
         }
 
@@ -348,7 +383,7 @@ impl AuthorityStore {
     ) -> Result<Option<TransactionEvents>, TypedStoreError> {
         let data = self
             .perpetual_tables
-            .events
+            .events()
             .safe_range_iter((*event_digest, 0)..=(*event_digest, usize::MAX))
             .map_ok(|(_, event)| event)
             .collect::<Result<Vec<_>, TypedStoreError>>()?;
@@ -369,16 +404,16 @@ impl AuthorityStore {
         &self,
         effects_digests: impl Iterator<Item = &'a TransactionEffectsDigest>,
     ) -> Result<Vec<Option<TransactionEffects>>, TypedStoreError> {
-        self.perpetual_tables.effects.multi_get(effects_digests)
+        self.perpetual_tables.effects().multi_get(effects_digests)
     }
 
     pub fn get_executed_effects(
         &self,
         tx_digest: &TransactionDigest,
     ) -> Result<Option<TransactionEffects>, TypedStoreError> {
-        let effects_digest = self.perpetual_tables.executed_effects.get(tx_digest)?;
+        let effects_digest = self.perpetual_tables.executed_effects().get(tx_digest)?;
         match effects_digest {
-            Some(digest) => Ok(self.perpetual_tables.effects.get(&digest)?),
+            Some(digest) => Ok(self.perpetual_tables.effects().get(&digest)?),
             None => Ok(None),
         }
     }
@@ -389,7 +424,7 @@ impl AuthorityStore {
         &self,
         digests: &[TransactionDigest],
     ) -> Result<Vec<Option<TransactionEffectsDigest>>, TypedStoreError> {
-        self.perpetual_tables.executed_effects.multi_get(digests)
+        self.perpetual_tables.executed_effects().multi_get(digests)
     }
 
     /// Given a list of transaction digests, returns a list of the corresponding effects only if they have been
@@ -398,7 +433,10 @@ impl AuthorityStore {
         &self,
         digests: &[TransactionDigest],
     ) -> Result<Vec<Option<TransactionEffects>>, TypedStoreError> {
-        let executed_effects_digests = self.perpetual_tables.executed_effects.multi_get(digests)?;
+        let executed_effects_digests = self
+            .perpetual_tables
+            .executed_effects()
+            .multi_get(digests)?;
         let effects = self.multi_get_effects(executed_effects_digests.iter().flatten())?;
         let mut tx_to_effects_map = effects
             .into_iter()
@@ -414,7 +452,7 @@ impl AuthorityStore {
     pub fn is_tx_already_executed(&self, digest: &TransactionDigest) -> SuiResult<bool> {
         Ok(self
             .perpetual_tables
-            .executed_effects
+            .executed_effects()
             .contains_key(digest)?)
     }
 
@@ -425,7 +463,7 @@ impl AuthorityStore {
     ) -> SuiResult<Option<MarkerValue>> {
         Ok(self
             .perpetual_tables
-            .object_per_epoch_marker_table_v2
+            .object_per_epoch_marker_table_v2()
             .get(&(epoch_id, object_key))?)
     }
 
@@ -439,7 +477,7 @@ impl AuthorityStore {
 
         let marker_entry = self
             .perpetual_tables
-            .object_per_epoch_marker_table_v2
+            .object_per_epoch_marker_table_v2()
             .reversed_safe_iter_with_bounds(Some(min_key), Some(max_key))?
             .next();
         match marker_entry {
@@ -462,7 +500,10 @@ impl AuthorityStore {
     ) -> SuiResult<(CheckpointSequenceNumber, GlobalStateHash)> {
         // We need to register waiters _before_ reading from the database to avoid race conditions
         let registration = self.root_state_notify_read.register_one(&epoch);
-        let hash = self.perpetual_tables.root_state_hash_by_epoch.get(&epoch)?;
+        let hash = self
+            .perpetual_tables
+            .root_state_hash_by_epoch()
+            .get(&epoch)?;
 
         let result = match hash {
             // Note that Some() clause also drops registration that is already fulfilled
@@ -483,10 +524,14 @@ impl AuthorityStore {
     ) -> SuiResult {
         let mut batch = self
             .perpetual_tables
+            .inner()
             .executed_transactions_to_checkpoint
             .batch();
         batch.insert_batch(
-            &self.perpetual_tables.executed_transactions_to_checkpoint,
+            &self
+                .perpetual_tables
+                .inner()
+                .executed_transactions_to_checkpoint,
             digests.iter().map(|d| (*d, (epoch, sequence))),
         )?;
         batch.write()?;
@@ -501,7 +546,7 @@ impl AuthorityStore {
     ) -> SuiResult<Option<(EpochId, CheckpointSequenceNumber)>> {
         Ok(self
             .perpetual_tables
-            .executed_transactions_to_checkpoint
+            .executed_transactions_to_checkpoint()
             .get(digest)?)
     }
 
@@ -512,7 +557,7 @@ impl AuthorityStore {
     ) -> SuiResult<Vec<Option<(EpochId, CheckpointSequenceNumber)>>> {
         Ok(self
             .perpetual_tables
-            .executed_transactions_to_checkpoint
+            .executed_transactions_to_checkpoint()
             .multi_get(digests)?
             .into_iter()
             .collect())
@@ -536,14 +581,14 @@ impl AuthorityStore {
     ) -> SuiResult<bool> {
         Ok(self
             .perpetual_tables
-            .objects
+            .objects()
             .contains_key(&ObjectKey(*object_id, version))?)
     }
 
     pub fn multi_object_exists_by_key(&self, object_keys: &[ObjectKey]) -> SuiResult<Vec<bool>> {
         Ok(self
             .perpetual_tables
-            .objects
+            .objects()
             .multi_contains_keys(object_keys.to_vec())?
             .into_iter()
             .collect())
@@ -559,7 +604,7 @@ impl AuthorityStore {
         };
         let mut iterator = self
             .perpetual_tables
-            .objects
+            .objects()
             .reversed_safe_iter_with_bounds(
                 Some(ObjectKey::min_for_id(object_id)),
                 Some(ObjectKey(*object_id, prior_version)),
@@ -581,7 +626,7 @@ impl AuthorityStore {
     ) -> Result<Vec<Option<Object>>, SuiError> {
         let wrappers = self
             .perpetual_tables
-            .objects
+            .objects()
             .multi_get(object_keys.to_vec())?;
         let mut ret = vec![];
 
@@ -619,12 +664,12 @@ impl AuthorityStore {
     /// NOTE: does not handle transaction lock.
     /// This is used to insert genesis objects
     fn insert_object_direct(&self, object_ref: ObjectRef, object: &Object) -> SuiResult {
-        let mut write_batch = self.perpetual_tables.objects.batch();
+        let mut write_batch = self.perpetual_tables.inner().objects.batch();
 
         // Insert object
         let store_object = get_store_object(object.clone());
         write_batch.insert_batch(
-            &self.perpetual_tables.objects,
+            &self.perpetual_tables.inner().objects,
             std::iter::once((ObjectKey::from(object_ref), store_object)),
         )?;
 
@@ -644,14 +689,14 @@ impl AuthorityStore {
     /// This function should only be used for initializing genesis and should remain private.
     #[instrument(level = "debug", skip_all)]
     pub(crate) fn bulk_insert_genesis_objects(&self, objects: &[Object]) -> SuiResult<()> {
-        let mut batch = self.perpetual_tables.objects.batch();
+        let mut batch = self.perpetual_tables.inner().objects.batch();
         let ref_and_objects: Vec<_> = objects
             .iter()
             .map(|o| (o.compute_object_reference(), o))
             .collect();
 
         batch.insert_batch(
-            &self.perpetual_tables.objects,
+            &self.perpetual_tables.inner().objects,
             ref_and_objects
                 .iter()
                 .map(|(oref, o)| (ObjectKey::from(oref), get_store_object((*o).clone()))),
@@ -730,12 +775,13 @@ impl AuthorityStore {
         epoch_start_configuration: &EpochStartConfiguration,
     ) -> SuiResult {
         self.perpetual_tables
+            .inner()
             .set_epoch_start_configuration(epoch_start_configuration)?;
         Ok(())
     }
 
     pub fn get_epoch_start_configuration(&self) -> SuiResult<Option<EpochStartConfiguration>> {
-        Ok(self.perpetual_tables.epoch_start_configuration.get(&())?)
+        Ok(self.perpetual_tables.epoch_start_configuration().get(&())?)
     }
 
     /// Updates the state resulting from the execution of a certificate.
@@ -753,7 +799,7 @@ impl AuthorityStore {
             written.extend(outputs.written.values().cloned());
         }
 
-        let mut write_batch = self.perpetual_tables.transactions.batch();
+        let mut write_batch = self.perpetual_tables.inner().transactions.batch();
         for outputs in tx_outputs {
             self.write_one_transaction_outputs(&mut write_batch, epoch_id, outputs)?;
         }
@@ -796,19 +842,22 @@ impl AuthorityStore {
         // Store the certificate indexed by transaction digest
         let transaction_digest = transaction.digest();
         write_batch.insert_batch(
-            &self.perpetual_tables.transactions,
+            &self.perpetual_tables.inner().transactions,
             iter::once((transaction_digest, transaction.serializable_ref())),
         )?;
 
         // Add batched writes for objects and locks.
         write_batch.insert_batch(
-            &self.perpetual_tables.object_per_epoch_marker_table_v2,
+            &self
+                .perpetual_tables
+                .inner()
+                .object_per_epoch_marker_table_v2,
             markers
                 .iter()
                 .map(|(key, marker_value)| ((epoch_id, *key), *marker_value)),
         )?;
         write_batch.insert_batch(
-            &self.perpetual_tables.objects,
+            &self.perpetual_tables.inner().objects,
             deleted
                 .iter()
                 .map(|key| (key, StoreObject::Deleted))
@@ -824,12 +873,12 @@ impl AuthorityStore {
             (ObjectKey(*id, version), store_object)
         });
 
-        write_batch.insert_batch(&self.perpetual_tables.objects, new_objects)?;
+        write_batch.insert_batch(&self.perpetual_tables.inner().objects, new_objects)?;
 
         // Write events into the new table keyed off of transaction_digest
         if effects.events_digest().is_some() {
             write_batch.insert_batch(
-                &self.perpetual_tables.events_2,
+                &self.perpetual_tables.inner().events_2,
                 [(transaction_digest, events)],
             )?;
         }
@@ -842,7 +891,7 @@ impl AuthorityStore {
             .enumerate()
             .map(|(i, e)| ((event_digest, i), e));
 
-        write_batch.insert_batch(&self.perpetual_tables.events, events)?;
+        write_batch.insert_batch(&self.perpetual_tables.inner().events, events)?;
 
         self.initialize_live_object_markers_impl(write_batch, new_locks_to_init, false)?;
 
@@ -853,11 +902,11 @@ impl AuthorityStore {
         let effects_digest = effects.digest();
         write_batch
             .insert_batch(
-                &self.perpetual_tables.effects,
+                &self.perpetual_tables.inner().effects,
                 [(effects_digest, effects.clone())],
             )?
             .insert_batch(
-                &self.perpetual_tables.executed_effects,
+                &self.perpetual_tables.inner().executed_effects,
                 [(transaction_digest, effects_digest)],
             )?;
 
@@ -869,9 +918,9 @@ impl AuthorityStore {
     /// Commits transactions only (not effects or other transaction outputs) to the db.
     /// See ExecutionCache::persist_transaction for more info
     pub(crate) fn persist_transaction(&self, tx: &VerifiedExecutableTransaction) -> SuiResult {
-        let mut batch = self.perpetual_tables.transactions.batch();
+        let mut batch = self.perpetual_tables.inner().transactions.batch();
         batch.insert_batch(
-            &self.perpetual_tables.transactions,
+            &self.perpetual_tables.inner().transactions,
             [(tx.digest(), tx.clone().into_unsigned().serializable_ref())],
         )?;
         batch.write()?;
@@ -896,7 +945,7 @@ impl AuthorityStore {
 
         let live_object_markers = self
             .perpetual_tables
-            .live_owned_object_markers
+            .live_owned_object_markers()
             .multi_get(owned_input_objects)?;
 
         let epoch_tables = epoch_store.tables()?;
@@ -971,7 +1020,7 @@ impl AuthorityStore {
     ) -> SuiLockResult {
         if self
             .perpetual_tables
-            .live_owned_object_markers
+            .live_owned_object_markers()
             .get(&obj_ref)?
             .is_none()
         {
@@ -1002,7 +1051,7 @@ impl AuthorityStore {
     ) -> SuiResult<ObjectRef> {
         let mut iterator = self
             .perpetual_tables
-            .live_owned_object_markers
+            .live_owned_object_markers()
             .reversed_safe_iter_with_bounds(
                 None,
                 Some((object_id, SequenceNumber::MAX, ObjectDigest::MAX)),
@@ -1033,7 +1082,7 @@ impl AuthorityStore {
     pub fn check_owned_objects_are_live(&self, objects: &[ObjectRef]) -> SuiResult {
         let locks = self
             .perpetual_tables
-            .live_owned_object_markers
+            .live_owned_object_markers()
             .multi_get(objects)?;
         for (lock, obj_ref) in locks.into_iter().zip(objects) {
             if lock.is_none() {
@@ -1057,7 +1106,7 @@ impl AuthorityStore {
         is_force_reset: bool,
     ) -> SuiResult {
         AuthorityStore::initialize_live_object_markers(
-            &self.perpetual_tables.live_owned_object_markers,
+            &self.perpetual_tables.inner().live_owned_object_markers,
             write_batch,
             objects,
             is_force_reset,
@@ -1111,7 +1160,7 @@ impl AuthorityStore {
     ) -> SuiResult {
         trace!(?objects, "delete_locks");
         write_batch.delete_batch(
-            &self.perpetual_tables.live_owned_object_markers,
+            &self.perpetual_tables.inner().live_owned_object_markers,
             objects.iter(),
         )?;
         Ok(())
@@ -1129,16 +1178,24 @@ impl AuthorityStore {
             epoch_store.delete_object_locks_for_test(objects);
         }
 
-        let mut batch = self.perpetual_tables.live_owned_object_markers.batch();
+        let mut batch = self
+            .perpetual_tables
+            .inner()
+            .live_owned_object_markers
+            .batch();
         batch
             .delete_batch(
-                &self.perpetual_tables.live_owned_object_markers,
+                &self.perpetual_tables.inner().live_owned_object_markers,
                 objects.iter(),
             )
             .unwrap();
         batch.write().unwrap();
 
-        let mut batch = self.perpetual_tables.live_owned_object_markers.batch();
+        let mut batch = self
+            .perpetual_tables
+            .inner()
+            .live_owned_object_markers
+            .batch();
         self.initialize_live_object_markers_impl(&mut batch, objects, false)
             .unwrap();
         batch.write().unwrap();
@@ -1168,15 +1225,15 @@ impl AuthorityStore {
         // We should never be reverting shared object transactions.
         assert!(effects.input_shared_objects().is_empty());
 
-        let mut write_batch = self.perpetual_tables.transactions.batch();
+        let mut write_batch = self.perpetual_tables.inner().transactions.batch();
         write_batch.delete_batch(
-            &self.perpetual_tables.executed_effects,
+            &self.perpetual_tables.inner().executed_effects,
             iter::once(tx_digest),
         )?;
         if let Some(events_digest) = effects.events_digest() {
-            write_batch.delete_batch(&self.perpetual_tables.events_2, [tx_digest])?;
+            write_batch.delete_batch(&self.perpetual_tables.inner().events_2, [tx_digest])?;
             write_batch.schedule_delete_range(
-                &self.perpetual_tables.events,
+                &self.perpetual_tables.inner().events,
                 &(*events_digest, usize::MIN),
                 &(*events_digest, usize::MAX),
             )?;
@@ -1186,13 +1243,16 @@ impl AuthorityStore {
             .all_tombstones()
             .into_iter()
             .map(|(id, version)| ObjectKey(id, version));
-        write_batch.delete_batch(&self.perpetual_tables.objects, tombstones)?;
+        write_batch.delete_batch(&self.perpetual_tables.inner().objects, tombstones)?;
 
         let all_new_object_keys = effects
             .all_changed_objects()
             .into_iter()
             .map(|((id, version, _), _, _)| ObjectKey(id, version));
-        write_batch.delete_batch(&self.perpetual_tables.objects, all_new_object_keys.clone())?;
+        write_batch.delete_batch(
+            &self.perpetual_tables.inner().objects,
+            all_new_object_keys.clone(),
+        )?;
 
         let modified_object_keys = effects
             .modified_at_versions()
@@ -1237,7 +1297,7 @@ impl AuthorityStore {
 
         // Delete new locks
         write_batch.delete_batch(
-            &self.perpetual_tables.live_owned_object_markers,
+            &self.perpetual_tables.inner().live_owned_object_markers,
             new_locks.flatten(),
         )?;
 
@@ -1322,14 +1382,14 @@ impl AuthorityStore {
         transaction: &VerifiedTransaction,
         transaction_effects: &TransactionEffects,
     ) -> Result<(), TypedStoreError> {
-        let mut write_batch = self.perpetual_tables.transactions.batch();
+        let mut write_batch = self.perpetual_tables.inner().transactions.batch();
         write_batch
             .insert_batch(
-                &self.perpetual_tables.transactions,
+                &self.perpetual_tables.inner().transactions,
                 [(transaction.digest(), transaction.serializable_ref())],
             )?
             .insert_batch(
-                &self.perpetual_tables.effects,
+                &self.perpetual_tables.inner().effects,
                 [(transaction_effects.digest(), transaction_effects)],
             )?;
 
@@ -1341,15 +1401,15 @@ impl AuthorityStore {
         &self,
         transactions: impl Iterator<Item = &'a VerifiedExecutionData>,
     ) -> Result<(), TypedStoreError> {
-        let mut write_batch = self.perpetual_tables.transactions.batch();
+        let mut write_batch = self.perpetual_tables.inner().transactions.batch();
         for tx in transactions {
             write_batch
                 .insert_batch(
-                    &self.perpetual_tables.transactions,
+                    &self.perpetual_tables.inner().transactions,
                     [(tx.transaction.digest(), tx.transaction.serializable_ref())],
                 )?
                 .insert_batch(
-                    &self.perpetual_tables.effects,
+                    &self.perpetual_tables.inner().effects,
                     [(tx.effects.digest(), &tx.effects)],
                 )?;
         }
@@ -1363,7 +1423,7 @@ impl AuthorityStore {
         tx_digests: &[TransactionDigest],
     ) -> Result<Vec<Option<VerifiedTransaction>>, TypedStoreError> {
         self.perpetual_tables
-            .transactions
+            .transactions()
             .multi_get(tx_digests)
             .map(|v| v.into_iter().map(|v| v.map(|v| v.into())).collect())
     }
@@ -1373,7 +1433,7 @@ impl AuthorityStore {
         tx_digest: &TransactionDigest,
     ) -> Result<Option<VerifiedTransaction>, TypedStoreError> {
         self.perpetual_tables
-            .transactions
+            .transactions()
             .get(tx_digest)
             .map(|v| v.map(|v| v.into()))
     }
@@ -1492,7 +1552,7 @@ impl AuthorityStore {
 
         if let Some(expected_imbalance) = self
             .perpetual_tables
-            .expected_storage_fund_imbalance
+            .expected_storage_fund_imbalance()
             .get(&())
             .expect("DB read cannot fail")
         {
@@ -1507,14 +1567,14 @@ impl AuthorityStore {
             );
         } else {
             self.perpetual_tables
-                .expected_storage_fund_imbalance
+                .expected_storage_fund_imbalance()
                 .insert(&(), &imbalance)
                 .expect("DB write cannot fail");
         }
 
         if let Some(expected_sui) = self
             .perpetual_tables
-            .expected_network_sui_amount
+            .expected_network_sui_amount()
             .get(&())
             .expect("DB read cannot fail")
         {
@@ -1687,7 +1747,7 @@ impl AuthorityStore {
             ..Default::default()
         };
         let _ = AuthorityStorePruner::prune_objects_for_eligible_epochs(
-            &self.perpetual_tables,
+            &self.perpetual_tables.inner(),
             checkpoint_store,
             rpc_index,
             None,
@@ -1696,7 +1756,7 @@ impl AuthorityStore {
             EPOCH_DURATION_MS_FOR_TESTING,
         )
         .await;
-        let _ = AuthorityStorePruner::compact(&self.perpetual_tables);
+        let _ = AuthorityStorePruner::compact(&self.perpetual_tables.inner());
     }
 
     #[cfg(test)]
@@ -1704,7 +1764,7 @@ impl AuthorityStore {
         &self,
         transaction_effects: Vec<TransactionEffects>,
     ) -> anyhow::Result<()> {
-        let mut wb = self.perpetual_tables.objects.batch();
+        let mut wb = self.perpetual_tables.inner().objects.batch();
 
         let mut object_keys_to_prune = vec![];
         for effects in &transaction_effects {
@@ -1715,7 +1775,7 @@ impl AuthorityStore {
         }
 
         wb.delete_batch(
-            &self.perpetual_tables.objects,
+            &self.perpetual_tables.inner().objects,
             object_keys_to_prune.into_iter(),
         )?;
         wb.write()?;
@@ -1774,6 +1834,7 @@ impl GlobalStateHashStore for AuthorityStore {
         acc: &GlobalStateHash,
     ) -> SuiResult {
         self.perpetual_tables
+            .inner()
             .root_state_hash_by_epoch
             .insert(&epoch, &(*last_checkpoint_of_epoch, acc.clone()))?;
         self.root_state_notify_read

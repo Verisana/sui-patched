@@ -687,11 +687,11 @@ impl ObjectStore for AuthorityPerpetualTables {
 }
 
 pub struct LiveSetIter<'a> {
-    iter: DbIterator<'a, (ObjectKey, StoreObjectWrapper)>,
-    tables: &'a AuthorityPerpetualTables,
-    prev: Option<(ObjectKey, StoreObjectWrapper)>,
+    pub iter: DbIterator<'a, (ObjectKey, StoreObjectWrapper)>,
+    pub tables: &'a AuthorityPerpetualTables,
+    pub prev: Option<(ObjectKey, StoreObjectWrapper)>,
     /// Whether a wrapped object is considered as a live object.
-    include_wrapped_object: bool,
+    pub include_wrapped_object: bool,
 }
 
 #[derive(Eq, PartialEq, Debug, Clone, Deserialize, Serialize, Hash)]
