@@ -12,7 +12,6 @@ use crate::authority::authority_per_epoch_store::AuthorityPerEpochStore;
 use crate::authority::authority_store::{
     ExecutionLockWriteGuard, LockDetailsDeprecated, ObjectLockStatus, SuiLockResult,
 };
-use crate::authority::backpressure::BackpressureManager;
 use crate::authority::readonly_authority_store::ReadonlyAuthorityStore;
 use crate::execution_cache::writeback_cache::assert_empty;
 use crate::fallback_fetch::{do_fallback_lookup, do_fallback_lookup_fallible};
@@ -77,8 +76,6 @@ pub struct ReadonlyWritebackCache {
         NotifyRead<TransactionDigest, Arc<TransactionOutputs>>,
 
     store: Arc<ReadonlyAuthorityStore>,
-    backpressure_threshold: u64,
-    backpressure_manager: Arc<BackpressureManager>,
     metrics: Arc<ExecutionCacheMetrics>,
 }
 
@@ -87,7 +84,6 @@ impl ReadonlyWritebackCache {
         config: &ExecutionCacheConfig,
         store: Arc<ReadonlyAuthorityStore>,
         metrics: Arc<ExecutionCacheMetrics>,
-        backpressure_manager: Arc<BackpressureManager>,
     ) -> Self {
         let packages = MokaCache::builder(8)
             .max_capacity(randomize_cache_capacity_in_tests(
@@ -106,8 +102,6 @@ impl ReadonlyWritebackCache {
             object_notify_read: NotifyRead::new(),
             fastpath_transaction_outputs_notify_read: NotifyRead::new(),
             store,
-            backpressure_manager,
-            backpressure_threshold: config.backpressure_threshold(),
             metrics,
         }
     }
@@ -372,57 +366,6 @@ impl ReadonlyWritebackCache {
         self.metrics
             .record_cache_multi_request(request_type, "db", count);
         &self.store
-    }
-
-    fn build_db_batch(&self, epoch: EpochId, digests: &[TransactionDigest]) -> Batch {
-        let _metrics_guard = mysten_metrics::monitored_scope("WritebackCache::build_db_batch");
-        let mut all_outputs = Vec::with_capacity(digests.len());
-        for tx in digests {
-            let Some(outputs) = self
-                .dirty
-                .pending_transaction_writes
-                .get(tx)
-                .map(|o| o.clone())
-            else {
-                // This can happen in the following rare case:
-                // All transactions in the checkpoint are committed to the db (by commit_transaction_outputs,
-                // called in CheckpointExecutor::process_executed_transactions), but the process crashes before
-                // the checkpoint water mark is bumped. We will then re-commit the checkpoint at startup,
-                // despite that all transactions are already executed.
-                warn!("Attempt to commit unknown transaction {:?}", tx);
-                continue;
-            };
-            all_outputs.push(outputs);
-        }
-
-        let batch = self
-            .store
-            .build_db_batch(epoch, &all_outputs)
-            .expect("db error");
-        (all_outputs, batch)
-    }
-
-    fn approximate_pending_transaction_count(&self) -> u64 {
-        let num_commits = self
-            .dirty
-            .total_transaction_commits
-            .load(std::sync::atomic::Ordering::Relaxed);
-
-        self.dirty
-            .total_transaction_inserts
-            .load(std::sync::atomic::Ordering::Relaxed)
-            .saturating_sub(num_commits)
-    }
-
-    fn set_backpressure(&self, pending_count: u64) {
-        let backpressure = pending_count > self.backpressure_threshold;
-        let backpressure_changed = self.backpressure_manager.set_backpressure(backpressure);
-        if backpressure_changed {
-            self.metrics.backpressure_toggles.inc();
-        }
-        self.metrics
-            .backpressure_status
-            .set(if backpressure { 1 } else { 0 });
     }
 
     fn flush_transactions_from_dirty_to_cached(

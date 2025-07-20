@@ -1,6 +1,5 @@
 use super::readonly_writeback_cache::ReadonlyWritebackCache;
 use super::{ExecutionCacheMetrics, ObjectCacheRead, TransactionCacheRead};
-use crate::authority::backpressure::BackpressureManager;
 use crate::authority::readonly_authority_store::ReadonlyAuthorityStore;
 use crate::implement_storage_traits;
 use prometheus::Registry;
@@ -52,18 +51,11 @@ pub fn build_readonly_execution_cache(
     cache_config: &ExecutionCacheConfig,
     prometheus_registry: &Registry,
     store: &Arc<ReadonlyAuthorityStore>,
-    backpressure_manager: Arc<BackpressureManager>,
 ) -> ReadonlyExecutionCacheTraitPointers {
     let execution_cache_metrics = Arc::new(ExecutionCacheMetrics::new(prometheus_registry));
 
     ReadonlyExecutionCacheTraitPointers::new(
-        ReadonlyWritebackCache::new(
-            cache_config,
-            store.clone(),
-            execution_cache_metrics,
-            backpressure_manager,
-        )
-        .into(),
+        ReadonlyWritebackCache::new(cache_config, store.clone(), execution_cache_metrics).into(),
     )
 }
 
