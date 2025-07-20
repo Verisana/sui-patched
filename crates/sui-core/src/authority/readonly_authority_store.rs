@@ -14,6 +14,7 @@ use crate::authority::epoch_start_configuration::{EpochFlag, EpochStartConfigura
 use crate::global_state_hasher::GlobalStateHashStore;
 use crate::rpc_index::RpcIndexStore;
 use crate::transaction_outputs::TransactionOutputs;
+use authority_store_tables::AuthorityPerpetualTablesReadOnly;
 use either::Either;
 use fastcrypto::hash::{HashFunction, MultisetHash, Sha3_256};
 use futures::stream::FuturesUnordered;
@@ -48,72 +49,17 @@ use mysten_common::sync::notify_read::NotifyRead;
 use sui_types::effects::{TransactionEffects, TransactionEvents};
 use sui_types::gas_coin::TOTAL_SUPPLY_MIST;
 
-pub const NUM_SHARDS: usize = 4096;
-
-pub struct AuthorityStoreMetrics {
-    sui_conservation_check_latency: IntGauge,
-    sui_conservation_live_object_count: IntGauge,
-    sui_conservation_live_object_size: IntGauge,
-    sui_conservation_imbalance: IntGauge,
-    sui_conservation_storage_fund: IntGauge,
-    sui_conservation_storage_fund_imbalance: IntGauge,
-    epoch_flags: IntGaugeVec,
-}
-
-impl AuthorityStoreMetrics {
-    pub fn new(registry: &Registry) -> Self {
-        Self {
-            sui_conservation_check_latency: register_int_gauge_with_registry!(
-                "sui_conservation_check_latency",
-                "Number of seconds took to scan all live objects in the store for SUI conservation check",
-                registry,
-            ).unwrap(),
-            sui_conservation_live_object_count: register_int_gauge_with_registry!(
-                "sui_conservation_live_object_count",
-                "Number of live objects in the store",
-                registry,
-            ).unwrap(),
-            sui_conservation_live_object_size: register_int_gauge_with_registry!(
-                "sui_conservation_live_object_size",
-                "Size in bytes of live objects in the store",
-                registry,
-            ).unwrap(),
-            sui_conservation_imbalance: register_int_gauge_with_registry!(
-                "sui_conservation_imbalance",
-                "Total amount of SUI in the network - 10B * 10^9. This delta shows the amount of imbalance",
-                registry,
-            ).unwrap(),
-            sui_conservation_storage_fund: register_int_gauge_with_registry!(
-                "sui_conservation_storage_fund",
-                "Storage Fund pool balance (only includes the storage fund proper that represents object storage)",
-                registry,
-            ).unwrap(),
-            sui_conservation_storage_fund_imbalance: register_int_gauge_with_registry!(
-                "sui_conservation_storage_fund_imbalance",
-                "Imbalance of storage fund, computed with storage_fund_balance - total_object_storage_rebates",
-                registry,
-            ).unwrap(),
-            epoch_flags: register_int_gauge_vec_with_registry!(
-                "epoch_flags",
-                "Local flags of the currently running epoch",
-                &["flag"],
-                registry,
-            ).unwrap(),
-        }
-    }
-}
-
 /// ALL_OBJ_VER determines whether we want to store all past
 /// versions of every object in the store. Authority doesn't store
 /// them, but other entities such as replicas will.
 /// S is a template on Authority signature state. This allows SuiDataStore to be used on either
 /// authorities or non-authorities. Specifically, when storing transactions and effects,
 /// S allows SuiDataStore to either store the authority signed version or unsigned version.
-pub struct AuthorityStore {
+pub struct ReadonlyAuthorityStore {
     /// Internal vector of locks to manage concurrent writes to the database
     mutex_table: MutexTable<ObjectDigest>,
 
-    pub(crate) perpetual_tables: Arc<AuthorityPerpetualTables>,
+    pub(crate) perpetual_tables: Arc<AuthorityPerpetualTablesReadOnly>,
 
     pub(crate) root_state_notify_read:
         NotifyRead<EpochId, (CheckpointSequenceNumber, GlobalStateHash)>,
@@ -127,7 +73,7 @@ pub struct AuthorityStore {
 pub type ExecutionLockReadGuard<'a> = tokio::sync::RwLockReadGuard<'a, EpochId>;
 pub type ExecutionLockWriteGuard<'a> = tokio::sync::RwLockWriteGuard<'a, EpochId>;
 
-impl AuthorityStore {
+impl ReadonlyAuthorityStore {
     /// Open an authority store by directory path.
     /// If the store is empty, initialize it using genesis.
     pub async fn open(

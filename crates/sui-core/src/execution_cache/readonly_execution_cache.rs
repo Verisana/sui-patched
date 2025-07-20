@@ -7,13 +7,14 @@ use crate::authority::backpressure::BackpressureManager;
 use crate::authority::epoch_start_configuration::EpochFlag;
 use crate::authority::epoch_start_configuration::EpochStartConfiguration;
 use crate::authority::AuthorityStore;
-use crate::global_state_hasher::GlobalStateHashStore;
 use crate::transaction_outputs::TransactionOutputs;
 use either::Either;
 use itertools::Itertools;
 use mysten_common::fatal;
 use sui_types::bridge::Bridge;
 
+use super::readonly_writeback_cache::ReadonlyWritebackCache;
+use super::ExecutionCacheMetrics;
 use futures::{future::BoxFuture, FutureExt};
 use prometheus::Registry;
 use std::collections::HashSet;
@@ -42,104 +43,56 @@ use sui_types::{
 use tracing::instrument;
 use typed_store::rocks::DBBatch;
 
-pub(crate) mod cache_types;
-pub mod metrics;
-mod object_locks;
-pub mod readonly_execution_cache;
-pub mod readonly_writeback_cache;
-pub mod writeback_cache;
-
-pub use writeback_cache::WritebackCache;
-
-use metrics::ExecutionCacheMetrics;
-
 // If you have Arc<ExecutionCache>, you cannot return a reference to it as
 // an &Arc<dyn ExecutionCacheRead> (for example), because the trait object is a fat pointer.
 // So, in order to be able to return &Arc<dyn T>, we create all the converted trait objects
 // (aka fat pointers) up front and return references to them.
 #[derive(Clone)]
-pub struct ExecutionCacheTraitPointers {
+pub struct ReadonlyExecutionCacheTraitPointers {
     pub object_cache_reader: Arc<dyn ObjectCacheRead>,
     pub transaction_cache_reader: Arc<dyn TransactionCacheRead>,
-    pub cache_writer: Arc<dyn ExecutionCacheWrite>,
     pub backing_store: Arc<dyn BackingStore + Send + Sync>,
     pub backing_package_store: Arc<dyn BackingPackageStore + Send + Sync>,
     pub object_store: Arc<dyn ObjectStore + Send + Sync>,
-    pub reconfig_api: Arc<dyn ExecutionCacheReconfigAPI>,
-    pub global_state_hash_store: Arc<dyn GlobalStateHashStore>,
-    pub checkpoint_cache: Arc<dyn CheckpointCache>,
-    pub state_sync_store: Arc<dyn StateSyncAPI>,
-    pub cache_commit: Arc<dyn ExecutionCacheCommit>,
     pub testing_api: Arc<dyn TestingAPI>,
 }
 
-impl ExecutionCacheTraitPointers {
+impl ReadonlyExecutionCacheTraitPointers {
     pub fn new<T>(cache: Arc<T>) -> Self
     where
         T: ObjectCacheRead
             + TransactionCacheRead
-            + ExecutionCacheWrite
             + BackingStore
             + BackingPackageStore
             + ObjectStore
-            + ExecutionCacheReconfigAPI
-            + GlobalStateHashStore
-            + CheckpointCache
-            + StateSyncAPI
-            + ExecutionCacheCommit
             + TestingAPI
             + 'static,
     {
         Self {
             object_cache_reader: cache.clone(),
             transaction_cache_reader: cache.clone(),
-            cache_writer: cache.clone(),
             backing_store: cache.clone(),
             backing_package_store: cache.clone(),
             object_store: cache.clone(),
-            reconfig_api: cache.clone(),
-            global_state_hash_store: cache.clone(),
-            checkpoint_cache: cache.clone(),
-            state_sync_store: cache.clone(),
-            cache_commit: cache.clone(),
             testing_api: cache.clone(),
         }
     }
 }
 
-pub fn build_execution_cache(
+pub fn build_readonly_execution_cache(
     cache_config: &ExecutionCacheConfig,
     prometheus_registry: &Registry,
     store: &Arc<AuthorityStore>,
     backpressure_manager: Arc<BackpressureManager>,
-) -> ExecutionCacheTraitPointers {
+) -> ReadonlyExecutionCacheTraitPointers {
     let execution_cache_metrics = Arc::new(ExecutionCacheMetrics::new(prometheus_registry));
 
-    ExecutionCacheTraitPointers::new(
-        WritebackCache::new(
+    ReadonlyExecutionCacheTraitPointers::new(
+        ReadonlyWritebackCache::new(
             cache_config,
             store.clone(),
             execution_cache_metrics,
             backpressure_manager,
-        )
-        .into(),
-    )
-}
-
-/// Should only be used for sui-tool or tests. Nodes must use build_execution_cache which
-/// uses the epoch_start_config to prevent cache impl from switching except at epoch boundaries.
-pub fn build_execution_cache_from_env(
-    prometheus_registry: &Registry,
-    store: &Arc<AuthorityStore>,
-) -> ExecutionCacheTraitPointers {
-    let execution_cache_metrics = Arc::new(ExecutionCacheMetrics::new(prometheus_registry));
-
-    ExecutionCacheTraitPointers::new(
-        WritebackCache::new(
-            &Default::default(),
-            store.clone(),
-            execution_cache_metrics,
-            BackpressureManager::new_for_tests(),
         )
         .into(),
     )
@@ -781,98 +734,8 @@ macro_rules! implement_storage_traits {
 }
 
 // Implement traits for a cache implementation that always go directly to the store.
-macro_rules! implement_passthrough_traits {
+macro_rules! implement_readonly_passthrough_traits {
     ($implementor: ident) => {
-        impl CheckpointCache for $implementor {
-            fn deprecated_get_transaction_checkpoint(
-                &self,
-                digest: &TransactionDigest,
-            ) -> Option<(EpochId, CheckpointSequenceNumber)> {
-                self.store
-                    .deprecated_get_transaction_checkpoint(digest)
-                    .expect("db error")
-            }
-
-            fn deprecated_multi_get_transaction_checkpoint(
-                &self,
-                digests: &[TransactionDigest],
-            ) -> Vec<Option<(EpochId, CheckpointSequenceNumber)>> {
-                self.store
-                    .deprecated_multi_get_transaction_checkpoint(digests)
-                    .expect("db error")
-            }
-
-            fn deprecated_insert_finalized_transactions(
-                &self,
-                digests: &[TransactionDigest],
-                epoch: EpochId,
-                sequence: CheckpointSequenceNumber,
-            ) {
-                self.store
-                    .deprecated_insert_finalized_transactions(digests, epoch, sequence)
-                    .expect("db error");
-            }
-        }
-
-        impl ExecutionCacheReconfigAPI for $implementor {
-            fn insert_genesis_object(&self, object: Object) {
-                self.insert_genesis_object_impl(object)
-            }
-
-            fn bulk_insert_genesis_objects(&self, objects: &[Object]) {
-                self.bulk_insert_genesis_objects_impl(objects)
-            }
-
-            fn revert_state_update(&self, digest: &TransactionDigest) {
-                self.revert_state_update_impl(digest)
-            }
-
-            fn set_epoch_start_configuration(&self, epoch_start_config: &EpochStartConfiguration) {
-                self.store
-                    .set_epoch_start_configuration(epoch_start_config)
-                    .expect("db error");
-            }
-
-            fn update_epoch_flags_metrics(&self, old: &[EpochFlag], new: &[EpochFlag]) {
-                self.store.update_epoch_flags_metrics(old, new)
-            }
-
-            fn clear_state_end_of_epoch(&self, execution_guard: &ExecutionLockWriteGuard<'_>) {
-                self.clear_state_end_of_epoch_impl(execution_guard)
-            }
-
-            fn expensive_check_sui_conservation(
-                &self,
-                old_epoch_store: &AuthorityPerEpochStore,
-            ) -> SuiResult {
-                self.store
-                    .expensive_check_sui_conservation(self, old_epoch_store)
-            }
-
-            fn checkpoint_db(&self, path: &std::path::Path) -> SuiResult {
-                self.store.perpetual_tables.checkpoint_db(path)
-            }
-
-            fn maybe_reaccumulate_state_hash(
-                &self,
-                cur_epoch_store: &AuthorityPerEpochStore,
-                new_protocol_version: ProtocolVersion,
-            ) {
-                self.store
-                    .maybe_reaccumulate_state_hash(cur_epoch_store, new_protocol_version)
-            }
-
-            fn reconfigure_cache<'a>(
-                &'a self,
-                _: &'a EpochStartConfiguration,
-            ) -> BoxFuture<'a, ()> {
-                // Since we now use WritebackCache directly at startup (if the epoch flag is set),
-                // this can be called at reconfiguration time. It is a no-op.
-                // TODO: remove this once we completely remove ProxyCache.
-                std::future::ready(()).boxed()
-            }
-        }
-
         impl TestingAPI for $implementor {
             fn database_for_testing(&self) -> Arc<AuthorityStore> {
                 self.store.clone()
@@ -881,16 +744,6 @@ macro_rules! implement_passthrough_traits {
     };
 }
 
-use implement_passthrough_traits;
+use implement_readonly_passthrough_traits;
 
-implement_storage_traits!(WritebackCache);
-
-pub trait ExecutionCacheAPI:
-    ObjectCacheRead
-    + ExecutionCacheWrite
-    + ExecutionCacheCommit
-    + ExecutionCacheReconfigAPI
-    + CheckpointCache
-    + StateSyncAPI
-{
-}
+implement_storage_traits!(ReadonlyWritebackCache);
