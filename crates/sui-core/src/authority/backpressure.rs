@@ -11,7 +11,7 @@ use tracing::{debug, info};
 use crate::checkpoints::CheckpointStore;
 
 #[derive(Debug, Default, Copy, Clone)]
-struct Watermarks {
+pub struct Watermarks {
     executed: CheckpointSequenceNumber,
     certified: CheckpointSequenceNumber,
 }
@@ -48,7 +48,7 @@ impl BackpressureManager {
         Self::new_from_watermarks(Default::default())
     }
 
-    fn new_from_watermarks(watermarks: Watermarks) -> Arc<Self> {
+    pub fn new_from_watermarks(watermarks: Watermarks) -> Arc<Self> {
         let (watermarks_sender, _) = watch::channel(watermarks);
         let (backpressure_sender, _) = watch::channel(false);
         Arc::new(Self {
