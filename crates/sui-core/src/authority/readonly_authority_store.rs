@@ -5,21 +5,14 @@ use crate::authority::epoch_start_configuration::{EpochFlag, EpochStartConfigura
 use crate::transaction_outputs::TransactionOutputs;
 use authority_store::{
     AuthorityStoreMetrics, LockDetailsDeprecated, LockDetailsWrapperDeprecated, SuiLockResult,
-    NUM_SHARDS,
 };
 use authority_store_tables::AuthorityPerpetualTablesReadOnly;
-use either::Either;
-use fastcrypto::hash::{HashFunction, MultisetHash};
-use itertools::izip;
-use mysten_common::sync::notify_read::NotifyRead;
 use std::iter;
 use std::ops::Not;
 use std::sync::Arc;
-use sui_storage::mutex_table::{MutexGuard, MutexTable};
 use sui_types::digests::TransactionEventsDigest;
 use sui_types::effects::{TransactionEffects, TransactionEvents};
 use sui_types::error::UserInputError;
-use sui_types::global_state_hash::GlobalStateHash;
 use sui_types::message_envelope::Message;
 use sui_types::storage::{FullObjectKey, MarkerValue, ObjectKey, ObjectOrTombstone, ObjectStore};
 use sui_types::sui_system_state::get_sui_system_state;
@@ -38,89 +31,20 @@ use typed_store::{
 /// authorities or non-authorities. Specifically, when storing transactions and effects,
 /// S allows SuiDataStore to either store the authority signed version or unsigned version.
 pub struct ReadonlyAuthorityStore {
-    /// Internal vector of locks to manage concurrent writes to the database
-    mutex_table: MutexTable<ObjectDigest>,
-
     pub(crate) perpetual_tables: Arc<AuthorityPerpetualTablesReadOnly>,
-
-    pub(crate) root_state_notify_read:
-        NotifyRead<EpochId, (CheckpointSequenceNumber, GlobalStateHash)>,
-
-    /// Whether to enable expensive SUI conservation check at epoch boundaries.
-    enable_epoch_sui_conservation_check: bool,
-
     metrics: AuthorityStoreMetrics,
 }
 
 impl ReadonlyAuthorityStore {
-    pub fn update_epoch_flags_metrics(&self, old: &[EpochFlag], new: &[EpochFlag]) {
-        for flag in old {
-            self.metrics
-                .epoch_flags
-                .with_label_values(&[&flag.to_string()])
-                .set(0);
-        }
-        for flag in new {
-            self.metrics
-                .epoch_flags
-                .with_label_values(&[&flag.to_string()])
-                .set(1);
-        }
-    }
-
-    // NB: This must only be called at time of reconfiguration. We take the execution lock write
-    // guard as an argument to ensure that this is the case.
-    pub fn clear_object_per_epoch_marker_table(
-        &self,
-        _execution_guard: &ExecutionLockWriteGuard<'_>,
-    ) -> SuiResult<()> {
-        // We can safely delete all entries in the per epoch marker table since this is only called
-        // at epoch boundaries (during reconfiguration). Therefore any entries that currently
-        // exist can be removed. Because of this we can use the `schedule_delete_all` method.
-        self.perpetual_tables
-            .object_per_epoch_marker_table
-            .schedule_delete_all()?;
-        Ok(self
-            .perpetual_tables
-            .object_per_epoch_marker_table_v2
-            .schedule_delete_all()?)
-    }
-
     pub fn open_readonly(
         perpetual_tables: Arc<AuthorityPerpetualTablesReadOnly>,
-        enable_epoch_sui_conservation_check: bool,
         registry: &Registry,
     ) -> SuiResult<Arc<Self>> {
         let store = Arc::new(Self {
-            mutex_table: MutexTable::new(NUM_SHARDS),
             perpetual_tables,
-            root_state_notify_read: NotifyRead::<
-                EpochId,
-                (CheckpointSequenceNumber, GlobalStateHash),
-            >::new(),
-            enable_epoch_sui_conservation_check,
             metrics: AuthorityStoreMetrics::new(registry),
         });
         Ok(store)
-    }
-
-    pub fn get_recovery_epoch_at_restart(&self) -> SuiResult<EpochId> {
-        self.perpetual_tables.get_recovery_epoch_at_restart()
-    }
-
-    pub fn get_effects(
-        &self,
-        effects_digest: &TransactionEffectsDigest,
-    ) -> SuiResult<Option<TransactionEffects>> {
-        Ok(self.perpetual_tables.effects.get(effects_digest)?)
-    }
-
-    /// Returns true if we have an effects structure for this transaction digest
-    pub fn effects_exists(&self, effects_digest: &TransactionEffectsDigest) -> SuiResult<bool> {
-        self.perpetual_tables
-            .effects
-            .contains_key(effects_digest)
-            .map_err(|e| e.into())
     }
 
     pub fn get_events(
@@ -190,32 +114,6 @@ impl ReadonlyAuthorityStore {
         self.perpetual_tables.executed_effects.multi_get(digests)
     }
 
-    /// Given a list of transaction digests, returns a list of the corresponding effects only if they have been
-    /// executed. For transactions that have not been executed, None is returned.
-    pub fn multi_get_executed_effects(
-        &self,
-        digests: &[TransactionDigest],
-    ) -> Result<Vec<Option<TransactionEffects>>, TypedStoreError> {
-        let executed_effects_digests = self.perpetual_tables.executed_effects.multi_get(digests)?;
-        let effects = self.multi_get_effects(executed_effects_digests.iter().flatten())?;
-        let mut tx_to_effects_map = effects
-            .into_iter()
-            .flatten()
-            .map(|effects| (*effects.transaction_digest(), effects))
-            .collect::<HashMap<_, _>>();
-        Ok(digests
-            .iter()
-            .map(|digest| tx_to_effects_map.remove(digest))
-            .collect())
-    }
-
-    pub fn is_tx_already_executed(&self, digest: &TransactionDigest) -> SuiResult<bool> {
-        Ok(self
-            .perpetual_tables
-            .executed_effects
-            .contains_key(digest)?)
-    }
-
     pub fn get_marker_value(
         &self,
         object_key: FullObjectKey,
@@ -252,81 +150,6 @@ impl ReadonlyAuthorityStore {
         }
     }
 
-    /// Returns future containing the state hash for the given epoch
-    /// once available
-    pub async fn notify_read_root_state_hash(
-        &self,
-        epoch: EpochId,
-    ) -> SuiResult<(CheckpointSequenceNumber, GlobalStateHash)> {
-        // We need to register waiters _before_ reading from the database to avoid race conditions
-        let registration = self.root_state_notify_read.register_one(&epoch);
-        let hash = self.perpetual_tables.root_state_hash_by_epoch.get(&epoch)?;
-
-        let result = match hash {
-            // Note that Some() clause also drops registration that is already fulfilled
-            Some(ready) => Either::Left(futures::future::ready(ready)),
-            None => Either::Right(registration),
-        }
-        .await;
-
-        Ok(result)
-    }
-
-    // DEPRECATED -- use function of same name in AuthorityPerEpochStore
-    pub fn deprecated_insert_finalized_transactions(
-        &self,
-        digests: &[TransactionDigest],
-        epoch: EpochId,
-        sequence: CheckpointSequenceNumber,
-    ) -> SuiResult {
-        let mut batch = self
-            .perpetual_tables
-            .executed_transactions_to_checkpoint
-            .batch();
-        batch.insert_batch(
-            &self.perpetual_tables.executed_transactions_to_checkpoint,
-            digests.iter().map(|d| (*d, (epoch, sequence))),
-        )?;
-        batch.write()?;
-        trace!("Transactions {digests:?} finalized at checkpoint {sequence} epoch {epoch}");
-        Ok(())
-    }
-
-    // DEPRECATED -- use function of same name in AuthorityPerEpochStore
-    pub fn deprecated_get_transaction_checkpoint(
-        &self,
-        digest: &TransactionDigest,
-    ) -> SuiResult<Option<(EpochId, CheckpointSequenceNumber)>> {
-        Ok(self
-            .perpetual_tables
-            .executed_transactions_to_checkpoint
-            .get(digest)?)
-    }
-
-    // DEPRECATED -- use function of same name in AuthorityPerEpochStore
-    pub fn deprecated_multi_get_transaction_checkpoint(
-        &self,
-        digests: &[TransactionDigest],
-    ) -> SuiResult<Vec<Option<(EpochId, CheckpointSequenceNumber)>>> {
-        Ok(self
-            .perpetual_tables
-            .executed_transactions_to_checkpoint
-            .multi_get(digests)?
-            .into_iter()
-            .collect())
-    }
-
-    /// Returns true if there are no objects in the database
-    pub fn database_is_empty(&self) -> SuiResult<bool> {
-        self.perpetual_tables.database_is_empty()
-    }
-
-    /// A function that acquires all locks associated with the objects (in order to avoid deadlocks).
-    fn acquire_locks(&self, input_objects: &[ObjectRef]) -> Vec<MutexGuard> {
-        self.mutex_table
-            .acquire_locks(input_objects.iter().map(|(_, _, digest)| *digest))
-    }
-
     pub fn object_exists_by_key(
         &self,
         object_id: &ObjectID,
@@ -347,32 +170,6 @@ impl ReadonlyAuthorityStore {
             .collect())
     }
 
-    fn get_object_ref_prior_to_key(
-        &self,
-        object_id: &ObjectID,
-        version: VersionNumber,
-    ) -> Result<Option<ObjectRef>, SuiError> {
-        let Some(prior_version) = version.one_before() else {
-            return Ok(None);
-        };
-        let mut iterator = self
-            .perpetual_tables
-            .objects
-            .reversed_safe_iter_with_bounds(
-                Some(ObjectKey::min_for_id(object_id)),
-                Some(ObjectKey(*object_id, prior_version)),
-            )?;
-
-        if let Some((object_key, value)) = iterator.next().transpose()? {
-            if object_key.0 == *object_id {
-                return Ok(Some(
-                    self.perpetual_tables.object_reference(&object_key, value)?,
-                ));
-            }
-        }
-        Ok(None)
-    }
-
     pub fn multi_get_objects_by_key(
         &self,
         object_keys: &[ObjectKey],
@@ -391,313 +188,6 @@ impl ReadonlyAuthorityStore {
             );
         }
         Ok(ret)
-    }
-
-    /// Get many objects
-    pub fn get_objects(&self, objects: &[ObjectID]) -> Result<Vec<Option<Object>>, SuiError> {
-        let mut result = Vec::new();
-        for id in objects {
-            result.push(self.get_object(id));
-        }
-        Ok(result)
-    }
-
-    // Methods to mutate the store
-
-    /// Insert a genesis object.
-    /// TODO: delete this method entirely (still used by authority_tests.rs)
-    pub(crate) fn insert_genesis_object(&self, object: Object) -> SuiResult {
-        // We only side load objects with a genesis parent transaction.
-        debug_assert!(object.previous_transaction == TransactionDigest::genesis_marker());
-        let object_ref = object.compute_object_reference();
-        self.insert_object_direct(object_ref, &object)
-    }
-
-    /// Insert an object directly into the store, and also update relevant tables
-    /// NOTE: does not handle transaction lock.
-    /// This is used to insert genesis objects
-    fn insert_object_direct(&self, object_ref: ObjectRef, object: &Object) -> SuiResult {
-        let mut write_batch = self.perpetual_tables.objects.batch();
-
-        // Insert object
-        let store_object = get_store_object(object.clone());
-        write_batch.insert_batch(
-            &self.perpetual_tables.objects,
-            std::iter::once((ObjectKey::from(object_ref), store_object)),
-        )?;
-
-        // Update the index
-        if object.get_single_owner().is_some() {
-            // Only initialize lock for address owned objects.
-            if !object.is_child_object() {
-                self.initialize_live_object_markers_impl(&mut write_batch, &[object_ref], false)?;
-            }
-        }
-
-        write_batch.write()?;
-
-        Ok(())
-    }
-
-    /// This function should only be used for initializing genesis and should remain private.
-    #[instrument(level = "debug", skip_all)]
-    pub(crate) fn bulk_insert_genesis_objects(&self, objects: &[Object]) -> SuiResult<()> {
-        let mut batch = self.perpetual_tables.objects.batch();
-        let ref_and_objects: Vec<_> = objects
-            .iter()
-            .map(|o| (o.compute_object_reference(), o))
-            .collect();
-
-        batch.insert_batch(
-            &self.perpetual_tables.objects,
-            ref_and_objects
-                .iter()
-                .map(|(oref, o)| (ObjectKey::from(oref), get_store_object((*o).clone()))),
-        )?;
-
-        let non_child_object_refs: Vec<_> = ref_and_objects
-            .iter()
-            .filter(|(_, object)| !object.is_child_object())
-            .map(|(oref, _)| *oref)
-            .collect();
-
-        self.initialize_live_object_markers_impl(
-            &mut batch,
-            &non_child_object_refs,
-            false, // is_force_reset
-        )?;
-
-        batch.write()?;
-
-        Ok(())
-    }
-
-    pub fn get_epoch_start_configuration(&self) -> SuiResult<Option<EpochStartConfiguration>> {
-        Ok(self.perpetual_tables.epoch_start_configuration.get(&())?)
-    }
-
-    /// Updates the state resulting from the execution of a certificate.
-    ///
-    /// Internally it checks that all locks for active inputs are at the correct
-    /// version, and then writes objects, certificates, parents and clean up locks atomically.
-    #[instrument(level = "debug", skip_all)]
-    pub fn build_db_batch(
-        &self,
-        epoch_id: EpochId,
-        tx_outputs: &[Arc<TransactionOutputs>],
-    ) -> SuiResult<DBBatch> {
-        let mut written = Vec::with_capacity(tx_outputs.len());
-        for outputs in tx_outputs {
-            written.extend(outputs.written.values().cloned());
-        }
-
-        let mut write_batch = self.perpetual_tables.transactions.batch();
-        for outputs in tx_outputs {
-            self.write_one_transaction_outputs(&mut write_batch, epoch_id, outputs)?;
-        }
-        // test crashing before writing the batch
-        fail_point!("crash");
-
-        trace!(
-            "built batch for committed transactions: {:?}",
-            tx_outputs
-                .iter()
-                .map(|tx| tx.transaction.digest())
-                .collect::<Vec<_>>()
-        );
-
-        // test crashing before notifying
-        fail_point!("crash");
-
-        Ok(write_batch)
-    }
-
-    fn write_one_transaction_outputs(
-        &self,
-        write_batch: &mut DBBatch,
-        epoch_id: EpochId,
-        tx_outputs: &TransactionOutputs,
-    ) -> SuiResult {
-        let TransactionOutputs {
-            transaction,
-            effects,
-            markers,
-            wrapped,
-            deleted,
-            written,
-            events,
-            locks_to_delete,
-            new_locks_to_init,
-            ..
-        } = tx_outputs;
-
-        // Store the certificate indexed by transaction digest
-        let transaction_digest = transaction.digest();
-        write_batch.insert_batch(
-            &self.perpetual_tables.transactions,
-            iter::once((transaction_digest, transaction.serializable_ref())),
-        )?;
-
-        // Add batched writes for objects and locks.
-        write_batch.insert_batch(
-            &self.perpetual_tables.object_per_epoch_marker_table_v2,
-            markers
-                .iter()
-                .map(|(key, marker_value)| ((epoch_id, *key), *marker_value)),
-        )?;
-        write_batch.insert_batch(
-            &self.perpetual_tables.objects,
-            deleted
-                .iter()
-                .map(|key| (key, StoreObject::Deleted))
-                .chain(wrapped.iter().map(|key| (key, StoreObject::Wrapped)))
-                .map(|(key, store_object)| (key, StoreObjectWrapper::from(store_object))),
-        )?;
-
-        // Insert each output object into the stores
-        let new_objects = written.iter().map(|(id, new_object)| {
-            let version = new_object.version();
-            trace!(?id, ?version, "writing object");
-            let store_object = get_store_object(new_object.clone());
-            (ObjectKey(*id, version), store_object)
-        });
-
-        write_batch.insert_batch(&self.perpetual_tables.objects, new_objects)?;
-
-        // Write events into the new table keyed off of transaction_digest
-        if effects.events_digest().is_some() {
-            write_batch.insert_batch(
-                &self.perpetual_tables.events_2,
-                [(transaction_digest, events)],
-            )?;
-        }
-
-        // Continue writing events into the old table for now keyed off of events digest
-        let event_digest = events.digest();
-        let events = events
-            .data
-            .iter()
-            .enumerate()
-            .map(|(i, e)| ((event_digest, i), e));
-
-        write_batch.insert_batch(&self.perpetual_tables.events, events)?;
-
-        self.initialize_live_object_markers_impl(write_batch, new_locks_to_init, false)?;
-
-        // Note: deletes locks for received objects as well (but not for objects that were in
-        // `Receiving` arguments which were not received)
-        self.delete_live_object_markers(write_batch, locks_to_delete)?;
-
-        let effects_digest = effects.digest();
-        write_batch
-            .insert_batch(
-                &self.perpetual_tables.effects,
-                [(effects_digest, effects.clone())],
-            )?
-            .insert_batch(
-                &self.perpetual_tables.executed_effects,
-                [(transaction_digest, effects_digest)],
-            )?;
-
-        debug!(effects_digest = ?effects.digest(), "commit_certificate finished");
-
-        Ok(())
-    }
-
-    /// Commits transactions only (not effects or other transaction outputs) to the db.
-    /// See ExecutionCache::persist_transaction for more info
-    pub(crate) fn persist_transaction(&self, tx: &VerifiedExecutableTransaction) -> SuiResult {
-        let mut batch = self.perpetual_tables.transactions.batch();
-        batch.insert_batch(
-            &self.perpetual_tables.transactions,
-            [(tx.digest(), tx.clone().into_unsigned().serializable_ref())],
-        )?;
-        batch.write()?;
-        Ok(())
-    }
-
-    pub fn acquire_transaction_locks(
-        &self,
-        epoch_store: &AuthorityPerEpochStore,
-        owned_input_objects: &[ObjectRef],
-        tx_digest: TransactionDigest,
-        signed_transaction: Option<VerifiedSignedTransaction>,
-    ) -> SuiResult {
-        let epoch = epoch_store.epoch();
-        // Other writers may be attempting to acquire locks on the same objects, so a mutex is
-        // required.
-        // TODO: replace with optimistic db_transactions (i.e. set lock to tx if none)
-        let _mutexes = self.acquire_locks(owned_input_objects);
-
-        trace!(?owned_input_objects, "acquire_locks");
-        let mut locks_to_write = Vec::new();
-
-        let live_object_markers = self
-            .perpetual_tables
-            .live_owned_object_markers
-            .multi_get(owned_input_objects)?;
-
-        let epoch_tables = epoch_store.tables()?;
-
-        let locks = epoch_tables.multi_get_locked_transactions(owned_input_objects)?;
-
-        assert_eq!(locks.len(), live_object_markers.len());
-
-        for (live_marker, lock, obj_ref) in izip!(
-            live_object_markers.into_iter(),
-            locks.into_iter(),
-            owned_input_objects
-        ) {
-            let Some(live_marker) = live_marker else {
-                let latest_lock = self.get_latest_live_version_for_object_id(obj_ref.0)?;
-                fp_bail!(UserInputError::ObjectVersionUnavailableForConsumption {
-                    provided_obj_ref: *obj_ref,
-                    current_version: latest_lock.1
-                }
-                .into());
-            };
-
-            let live_marker = live_marker.map(|l| l.migrate().into_inner());
-
-            if let Some(LockDetailsDeprecated {
-                epoch: previous_epoch,
-                ..
-            }) = &live_marker
-            {
-                // this must be from a prior epoch, because we no longer write LockDetails to
-                // owned_object_transaction_locks
-                assert!(
-                    previous_epoch < &epoch,
-                    "lock for {:?} should be from a prior epoch",
-                    obj_ref
-                );
-            }
-
-            if let Some(previous_tx_digest) = &lock {
-                if previous_tx_digest == &tx_digest {
-                    // no need to re-write lock
-                    continue;
-                } else {
-                    // TODO: add metrics here
-                    info!(prev_tx_digest = ?previous_tx_digest,
-                          cur_tx_digest = ?tx_digest,
-                          "Cannot acquire lock: conflicting transaction!");
-                    return Err(SuiError::ObjectLockConflict {
-                        obj_ref: *obj_ref,
-                        pending_transaction: *previous_tx_digest,
-                    });
-                }
-            }
-
-            locks_to_write.push((*obj_ref, tx_digest));
-        }
-
-        if !locks_to_write.is_empty() {
-            trace!(?locks_to_write, "Writing locks");
-            epoch_tables.write_transaction_locks(signed_transaction, locks_to_write.into_iter())?;
-        }
-
-        Ok(())
     }
 
     /// Gets ObjectLockInfo that represents state of lock on an object.
@@ -786,204 +276,6 @@ impl ReadonlyAuthorityStore {
         Ok(())
     }
 
-    /// Initialize a lock to None (but exists) for a given list of ObjectRefs.
-    /// Returns SuiError::ObjectLockAlreadyInitialized if the lock already exists and is locked to a transaction
-    fn initialize_live_object_markers_impl(
-        &self,
-        write_batch: &mut DBBatch,
-        objects: &[ObjectRef],
-        is_force_reset: bool,
-    ) -> SuiResult {
-        ReadonlyAuthorityStore::initialize_live_object_markers(
-            &self.perpetual_tables.live_owned_object_markers,
-            write_batch,
-            objects,
-            is_force_reset,
-        )
-    }
-
-    pub fn initialize_live_object_markers(
-        live_object_marker_table: &DBMap<ObjectRef, Option<LockDetailsWrapperDeprecated>>,
-        write_batch: &mut DBBatch,
-        objects: &[ObjectRef],
-        is_force_reset: bool,
-    ) -> SuiResult {
-        trace!(?objects, "initialize_locks");
-
-        let live_object_markers = live_object_marker_table.multi_get(objects)?;
-
-        if !is_force_reset {
-            // If any live_object_markers exist and are not None, return errors for them
-            // Note we don't check if there is a pre-existing lock. this is because initializing the live
-            // object marker will not overwrite the lock and cause the validator to equivocate.
-            let existing_live_object_markers: Vec<ObjectRef> = live_object_markers
-                .iter()
-                .zip(objects)
-                .filter_map(|(lock_opt, objref)| {
-                    lock_opt.clone().flatten().map(|_tx_digest| *objref)
-                })
-                .collect();
-            if !existing_live_object_markers.is_empty() {
-                info!(
-                    ?existing_live_object_markers,
-                    "Cannot initialize live_object_markers because some exist already"
-                );
-                return Err(SuiError::ObjectLockAlreadyInitialized {
-                    refs: existing_live_object_markers,
-                });
-            }
-        }
-
-        write_batch.insert_batch(
-            live_object_marker_table,
-            objects.iter().map(|obj_ref| (obj_ref, None)),
-        )?;
-        Ok(())
-    }
-
-    /// Removes locks for a given list of ObjectRefs.
-    fn delete_live_object_markers(
-        &self,
-        write_batch: &mut DBBatch,
-        objects: &[ObjectRef],
-    ) -> SuiResult {
-        trace!(?objects, "delete_locks");
-        write_batch.delete_batch(
-            &self.perpetual_tables.live_owned_object_markers,
-            objects.iter(),
-        )?;
-        Ok(())
-    }
-
-    #[cfg(test)]
-    pub(crate) fn reset_locks_for_test(
-        &self,
-        transactions: &[TransactionDigest],
-        objects: &[ObjectRef],
-        epoch_store: &AuthorityPerEpochStore,
-    ) {
-        for tx in transactions {
-            epoch_store.delete_signed_transaction_for_test(tx);
-            epoch_store.delete_object_locks_for_test(objects);
-        }
-
-        let mut batch = self.perpetual_tables.live_owned_object_markers.batch();
-        batch
-            .delete_batch(
-                &self.perpetual_tables.live_owned_object_markers,
-                objects.iter(),
-            )
-            .unwrap();
-        batch.write().unwrap();
-
-        let mut batch = self.perpetual_tables.live_owned_object_markers.batch();
-        self.initialize_live_object_markers_impl(&mut batch, objects, false)
-            .unwrap();
-        batch.write().unwrap();
-    }
-
-    /// This function is called at the end of epoch for each transaction that's
-    /// executed locally on the validator but didn't make to the last checkpoint.
-    /// The effects of the execution is reverted here.
-    /// The following things are reverted:
-    /// 1. All new object states are deleted.
-    /// 2. owner_index table change is reverted.
-    ///
-    /// NOTE: transaction and effects are intentionally not deleted. It's
-    /// possible that if this node is behind, the network will execute the
-    /// transaction in a later epoch. In that case, we need to keep it saved
-    /// so that when we receive the checkpoint that includes it from state
-    /// sync, we are able to execute the checkpoint.
-    /// TODO: implement GC for transactions that are no longer needed.
-    pub fn revert_state_update(&self, tx_digest: &TransactionDigest) -> SuiResult {
-        let Some(effects) = self.get_executed_effects(tx_digest)? else {
-            info!("Not reverting {:?} as it was not executed", tx_digest);
-            return Ok(());
-        };
-
-        info!(?tx_digest, ?effects, "reverting transaction");
-
-        // We should never be reverting shared object transactions.
-        assert!(effects.input_shared_objects().is_empty());
-
-        let mut write_batch = self.perpetual_tables.transactions.batch();
-        write_batch.delete_batch(
-            &self.perpetual_tables.executed_effects,
-            iter::once(tx_digest),
-        )?;
-        if let Some(events_digest) = effects.events_digest() {
-            write_batch.delete_batch(&self.perpetual_tables.events_2, [tx_digest])?;
-            write_batch.schedule_delete_range(
-                &self.perpetual_tables.events,
-                &(*events_digest, usize::MIN),
-                &(*events_digest, usize::MAX),
-            )?;
-        }
-
-        let tombstones = effects
-            .all_tombstones()
-            .into_iter()
-            .map(|(id, version)| ObjectKey(id, version));
-        write_batch.delete_batch(&self.perpetual_tables.objects, tombstones)?;
-
-        let all_new_object_keys = effects
-            .all_changed_objects()
-            .into_iter()
-            .map(|((id, version, _), _, _)| ObjectKey(id, version));
-        write_batch.delete_batch(&self.perpetual_tables.objects, all_new_object_keys.clone())?;
-
-        let modified_object_keys = effects
-            .modified_at_versions()
-            .into_iter()
-            .map(|(id, version)| ObjectKey(id, version));
-
-        macro_rules! get_objects_and_locks {
-            ($object_keys: expr) => {
-                self.perpetual_tables
-                    .objects
-                    .multi_get($object_keys.clone())?
-                    .into_iter()
-                    .zip($object_keys)
-                    .filter_map(|(obj_opt, key)| {
-                        let obj = self
-                            .perpetual_tables
-                            .object(
-                                &key,
-                                obj_opt.unwrap_or_else(|| {
-                                    panic!("Older object version not found: {:?}", key)
-                                }),
-                            )
-                            .expect("Matching indirect object not found")?;
-
-                        if obj.is_immutable() {
-                            return None;
-                        }
-
-                        let obj_ref = obj.compute_object_reference();
-                        Some(obj.is_address_owned().then_some(obj_ref))
-                    })
-            };
-        }
-
-        let old_locks = get_objects_and_locks!(modified_object_keys);
-        let new_locks = get_objects_and_locks!(all_new_object_keys);
-
-        let old_locks: Vec<_> = old_locks.flatten().collect();
-
-        // Re-create old locks.
-        self.initialize_live_object_markers_impl(&mut write_batch, &old_locks, true)?;
-
-        // Delete new locks
-        write_batch.delete_batch(
-            &self.perpetual_tables.live_owned_object_markers,
-            new_locks.flatten(),
-        )?;
-
-        write_batch.write()?;
-
-        Ok(())
-    }
-
     /// Return the object with version less then or eq to the provided seq number.
     /// This is used by indexer to find the correct version of dynamic field child object.
     /// We do not store the version of the child object, but because of lamport timestamp,
@@ -1012,18 +304,6 @@ impl ReadonlyAuthorityStore {
     ) -> Result<Option<ObjectRef>, SuiError> {
         self.perpetual_tables
             .get_latest_object_ref_or_tombstone(object_id)
-    }
-
-    /// Returns the latest object reference if and only if the object is still live (i.e. it does
-    /// not return tombstones)
-    pub fn get_latest_object_ref_if_alive(
-        &self,
-        object_id: ObjectID,
-    ) -> Result<Option<ObjectRef>, SuiError> {
-        match self.get_latest_object_ref_or_tombstone(object_id)? {
-            Some(objref) if objref.2.is_alive() => Ok(Some(objref)),
-            _ => Ok(None),
-        }
     }
 
     /// Returns the latest object we have for this object_id in the objects table.
@@ -1055,47 +335,6 @@ impl ReadonlyAuthorityStore {
         Ok(Some((object_key, ObjectOrTombstone::Object(object))))
     }
 
-    pub fn insert_transaction_and_effects(
-        &self,
-        transaction: &VerifiedTransaction,
-        transaction_effects: &TransactionEffects,
-    ) -> Result<(), TypedStoreError> {
-        let mut write_batch = self.perpetual_tables.transactions.batch();
-        write_batch
-            .insert_batch(
-                &self.perpetual_tables.transactions,
-                [(transaction.digest(), transaction.serializable_ref())],
-            )?
-            .insert_batch(
-                &self.perpetual_tables.effects,
-                [(transaction_effects.digest(), transaction_effects)],
-            )?;
-
-        write_batch.write()?;
-        Ok(())
-    }
-
-    pub fn multi_insert_transaction_and_effects<'a>(
-        &self,
-        transactions: impl Iterator<Item = &'a VerifiedExecutionData>,
-    ) -> Result<(), TypedStoreError> {
-        let mut write_batch = self.perpetual_tables.transactions.batch();
-        for tx in transactions {
-            write_batch
-                .insert_batch(
-                    &self.perpetual_tables.transactions,
-                    [(tx.transaction.digest(), tx.transaction.serializable_ref())],
-                )?
-                .insert_batch(
-                    &self.perpetual_tables.effects,
-                    [(tx.effects.digest(), &tx.effects)],
-                )?;
-        }
-
-        write_batch.write()?;
-        Ok(())
-    }
-
     pub fn multi_get_transaction_blocks(
         &self,
         tx_digests: &[TransactionDigest],
@@ -1104,26 +343,6 @@ impl ReadonlyAuthorityStore {
             .transactions
             .multi_get(tx_digests)
             .map(|v| v.into_iter().map(|v| v.map(|v| v.into())).collect())
-    }
-
-    pub fn get_transaction_block(
-        &self,
-        tx_digest: &TransactionDigest,
-    ) -> Result<Option<VerifiedTransaction>, TypedStoreError> {
-        self.perpetual_tables
-            .transactions
-            .get(tx_digest)
-            .map(|v| v.map(|v| v.into()))
-    }
-
-    /// This function reads the DB directly to get the system state object.
-    /// If reconfiguration is happening at the same time, there is no guarantee whether we would be getting
-    /// the old or the new system state object.
-    /// Hence this function should only be called during RPC reads where data race is not a major concern.
-    /// In general we should avoid this as much as possible.
-    /// If the intent is for testing, you can use AuthorityState:: get_sui_system_state_object_for_testing.
-    pub fn get_sui_system_state_object_unsafe(&self) -> SuiResult<SuiSystemState> {
-        get_sui_system_state(self.perpetual_tables.as_ref())
     }
 }
 
