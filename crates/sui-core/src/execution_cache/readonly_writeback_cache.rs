@@ -1,54 +1,23 @@
-// Copyright (c) Mysten Labs, Inc.
-// SPDX-License-Identifier: Apache-2.0
-
-//! MemoryCache is a cache for the transaction execution which delays writes to the database until
-//! transaction results are certified (i.e. they appear in a certified checkpoint, or an effects cert
-//! is observed by a fullnode). The cache also stores committed data in memory in order to serve
-//! future reads without hitting the database.
-//!
-//! For storing uncommitted transaction outputs, we cannot evict the data at all until it is written
-//! to disk. Committed data not only can be evicted, but it is also unbounded (imagine a stream of
-//! transactions that keep splitting a coin into smaller coins).
-//!
-//! We also want to be able to support negative cache hits (i.e. the case where we can determine an
-//! object does not exist without hitting the database).
-//!
-//! To achieve both of these goals, we split the cache data into two pieces, a dirty set and a cached
-//! set. The dirty set has no automatic evictions, data is only removed after being committed. The
-//! cached set is in a bounded-sized cache with automatic evictions. In order to support negative
-//! cache hits, we treat the two halves of the cache as FIFO queue. Newly written (dirty) versions are
-//! inserted to one end of the dirty queue. As versions are committed to disk, they are
-//! removed from the other end of the dirty queue and inserted into the cache queue. The cache queue
-//! is truncated if it exceeds its maximum size, by removing all but the N newest versions.
-//!
-//! This gives us the property that the sequence of versions in the dirty and cached queues are the
-//! most recent versions of the object, i.e. there can be no "gaps". This allows for the following:
-//!
-//!   - Negative cache hits: If the queried version is not in memory, but is higher than the smallest
-//!     version in the cached queue, it does not exist in the db either.
-//!   - Bounded reads: When reading the most recent version that is <= some version bound, we can
-//!     correctly satisfy this query from the cache, or determine that we must go to the db.
-//!
-//! Note that at any time, either or both the dirty or the cached queue may be non-existent. There may be no
-//! dirty versions of the objects, in which case there will be no dirty queue. And, the cached queue
-//! may be evicted from the cache, in which case there will be no cached queue. Because only the cached
-//! queue can be evicted (the dirty queue can only become empty by moving versions from it to the cached
-//! queue), the "highest versions" property still holds in all cases.
-//!
-//! The above design is used for both objects and markers.
-
+use super::cache_types::Ticket;
+use super::writeback_cache::{
+    CachedCommittedData, LatestObjectCacheEntry, ObjectEntry, PointCacheItem, UncommittedData,
+};
+use super::WritebackCache;
+use super::{
+    cache_types::{CacheResult, CachedVersionMap, MonotonicCache},
+    object_locks::ObjectLocks,
+    Batch, ExecutionCacheCommit, ExecutionCacheMetrics, ObjectCacheRead, TransactionCacheRead,
+};
 use crate::authority::authority_per_epoch_store::AuthorityPerEpochStore;
 use crate::authority::authority_store::{
     ExecutionLockWriteGuard, LockDetailsDeprecated, ObjectLockStatus, SuiLockResult,
 };
-use crate::authority::authority_store_tables::LiveObject;
 use crate::authority::backpressure::BackpressureManager;
-use crate::authority::epoch_start_configuration::{EpochFlag, EpochStartConfiguration};
-use crate::authority::AuthorityStore;
+use crate::authority::readonly_authority_store::ReadonlyAuthorityStore;
+use crate::execution_cache::writeback_cache::assert_empty;
 use crate::fallback_fetch::{do_fallback_lookup, do_fallback_lookup_fallible};
-use crate::global_state_hasher::GlobalStateHashStore;
 use crate::transaction_outputs::TransactionOutputs;
-
+use crate::{check_cache_entry_by_latest, check_cache_entry_by_version};
 use dashmap::mapref::entry::Entry as DashMapEntry;
 use dashmap::DashMap;
 use futures::{future::BoxFuture, FutureExt};
@@ -56,366 +25,24 @@ use moka::sync::SegmentedCache as MokaCache;
 use mysten_common::random_util::randomize_cache_capacity_in_tests;
 use mysten_common::sync::notify_read::NotifyRead;
 use parking_lot::Mutex;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::HashSet;
 use std::hash::Hash;
-use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use sui_config::ExecutionCacheConfig;
-use sui_macros::fail_point;
-use sui_protocol_config::ProtocolVersion;
-use sui_types::base_types::{
-    EpochId, FullObjectID, ObjectID, ObjectRef, SequenceNumber, VerifiedExecutionData,
-};
+use sui_types::base_types::{EpochId, FullObjectID, ObjectID, ObjectRef, SequenceNumber};
 use sui_types::bridge::{get_bridge, Bridge};
 use sui_types::digests::{ObjectDigest, TransactionDigest, TransactionEffectsDigest};
 use sui_types::effects::{TransactionEffects, TransactionEvents};
 use sui_types::error::{SuiError, SuiResult, UserInputError};
-use sui_types::executable_transaction::VerifiedExecutableTransaction;
-use sui_types::global_state_hash::GlobalStateHash;
-use sui_types::message_envelope::Message;
 use sui_types::messages_checkpoint::CheckpointSequenceNumber;
 use sui_types::object::Object;
 use sui_types::storage::{
     FullObjectKey, InputKey, MarkerValue, ObjectKey, ObjectOrTombstone, ObjectStore, PackageObject,
 };
 use sui_types::sui_system_state::{get_sui_system_state, SuiSystemState};
-use sui_types::transaction::{VerifiedSignedTransaction, VerifiedTransaction};
+use sui_types::transaction::VerifiedTransaction;
 use tap::TapOptional;
-use tracing::{debug, info, instrument, trace, warn};
-
-use super::cache_types::Ticket;
-use super::ExecutionCacheAPI;
-use super::{
-    cache_types::{CacheResult, CachedVersionMap, IsNewer, MonotonicCache},
-    object_locks::ObjectLocks,
-    Batch, CheckpointCache, ExecutionCacheCommit, ExecutionCacheMetrics, ExecutionCacheReconfigAPI,
-    ExecutionCacheWrite, ObjectCacheRead, StateSyncAPI, TestingAPI, TransactionCacheRead,
-};
-
-#[cfg(test)]
-#[path = "unit_tests/writeback_cache_tests.rs"]
-pub mod writeback_cache_tests;
-
-#[cfg(test)]
-#[path = "unit_tests/notify_read_input_objects_tests.rs"]
-mod notify_read_input_objects_tests;
-
-#[derive(Clone, PartialEq, Eq)]
-enum ObjectEntry {
-    Object(Object),
-    Deleted,
-    Wrapped,
-}
-
-impl ObjectEntry {
-    #[cfg(test)]
-    fn unwrap_object(&self) -> &Object {
-        match self {
-            ObjectEntry::Object(o) => o,
-            _ => panic!("unwrap_object called on non-Object"),
-        }
-    }
-
-    fn is_tombstone(&self) -> bool {
-        match self {
-            ObjectEntry::Deleted | ObjectEntry::Wrapped => true,
-            ObjectEntry::Object(_) => false,
-        }
-    }
-}
-
-impl std::fmt::Debug for ObjectEntry {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ObjectEntry::Object(o) => {
-                write!(f, "ObjectEntry::Object({:?})", o.compute_object_reference())
-            }
-            ObjectEntry::Deleted => write!(f, "ObjectEntry::Deleted"),
-            ObjectEntry::Wrapped => write!(f, "ObjectEntry::Wrapped"),
-        }
-    }
-}
-
-impl From<Object> for ObjectEntry {
-    fn from(object: Object) -> Self {
-        ObjectEntry::Object(object)
-    }
-}
-
-impl From<ObjectOrTombstone> for ObjectEntry {
-    fn from(object: ObjectOrTombstone) -> Self {
-        match object {
-            ObjectOrTombstone::Object(o) => o.into(),
-            ObjectOrTombstone::Tombstone(obj_ref) => {
-                if obj_ref.2.is_deleted() {
-                    ObjectEntry::Deleted
-                } else if obj_ref.2.is_wrapped() {
-                    ObjectEntry::Wrapped
-                } else {
-                    panic!("tombstone digest must either be deleted or wrapped");
-                }
-            }
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum LatestObjectCacheEntry {
-    Object(SequenceNumber, ObjectEntry),
-    NonExistent,
-}
-
-impl LatestObjectCacheEntry {
-    #[cfg(test)]
-    fn version(&self) -> Option<SequenceNumber> {
-        match self {
-            LatestObjectCacheEntry::Object(version, _) => Some(*version),
-            LatestObjectCacheEntry::NonExistent => None,
-        }
-    }
-
-    fn is_alive(&self) -> bool {
-        match self {
-            LatestObjectCacheEntry::Object(_, entry) => !entry.is_tombstone(),
-            LatestObjectCacheEntry::NonExistent => false,
-        }
-    }
-}
-
-impl IsNewer for LatestObjectCacheEntry {
-    fn is_newer_than(&self, other: &LatestObjectCacheEntry) -> bool {
-        match (self, other) {
-            (LatestObjectCacheEntry::Object(v1, _), LatestObjectCacheEntry::Object(v2, _)) => {
-                v1 > v2
-            }
-            (LatestObjectCacheEntry::Object(_, _), LatestObjectCacheEntry::NonExistent) => true,
-            _ => false,
-        }
-    }
-}
-
-type MarkerKey = (EpochId, FullObjectID);
-
-/// UncommittedData stores execution outputs that are not yet written to the db. Entries in this
-/// struct can only be purged after they are committed.
-struct UncommittedData {
-    /// The object dirty set. All writes go into this table first. After we flush the data to the
-    /// db, the data is removed from this table and inserted into the object_cache.
-    ///
-    /// This table may contain both live and dead objects, since we flush both live and dead
-    /// objects to the db in order to support past object queries on fullnodes.
-    ///
-    /// Further, we only remove objects in FIFO order, which ensures that the cached
-    /// sequence of objects has no gaps. In other words, if we have versions 4, 8, 13 of
-    /// an object, we can deduce that version 9 does not exist. This also makes child object
-    /// reads efficient. `object_cache` cannot contain a more recent version of an object than
-    /// `objects`, and neither can have any gaps. Therefore if there is any object <= the version
-    /// bound for a child read in objects, it is the correct object to return.
-    objects: DashMap<ObjectID, CachedVersionMap<ObjectEntry>>,
-
-    // Markers for received objects and deleted shared objects. This contains all of the dirty
-    // marker state, which is committed to the db at the same time as other transaction data.
-    // After markers are committed to the db we remove them from this table and insert them into
-    // marker_cache.
-    markers: DashMap<MarkerKey, CachedVersionMap<MarkerValue>>,
-
-    transaction_effects: DashMap<TransactionEffectsDigest, TransactionEffects>,
-
-    transaction_events: DashMap<TransactionDigest, TransactionEvents>,
-
-    executed_effects_digests: DashMap<TransactionDigest, TransactionEffectsDigest>,
-
-    // Transaction outputs that have not yet been written to the DB. Items are removed from this
-    // table as they are flushed to the db.
-    pending_transaction_writes: DashMap<TransactionDigest, Arc<TransactionOutputs>>,
-
-    // Transactions outputs from Mysticeti fastpath certified transaction executions.
-    // These outputs are not written to pending_transaction_writes until we are sure
-    // that they will not get rejected by consensus. This ensures that no dependent
-    // transactions can sign using the outputs of a fastpath certified transaction.
-    // Otherwise it will be challenging to revert them.
-    // We use a cache because it is possible to have entries that are not finalized
-    // due to data races, i.e. a transaction is first fastpath certified, then
-    // rejected through consensus commit, but at the same time it was executed
-    // and outputs are written here. We won't have a chance to remove them anymore.
-    // So we rely on the cache to evict them eventually.
-    // It is also safe to evict a transaction that will eventually be finalized,
-    // as we will just re-execute it.
-    fastpath_transaction_outputs: MokaCache<TransactionDigest, Arc<TransactionOutputs>>,
-
-    total_transaction_inserts: AtomicU64,
-    total_transaction_commits: AtomicU64,
-}
-
-impl UncommittedData {
-    fn new(config: &ExecutionCacheConfig) -> Self {
-        Self {
-            objects: DashMap::with_shard_amount(2048),
-            markers: DashMap::with_shard_amount(2048),
-            transaction_effects: DashMap::with_shard_amount(2048),
-            executed_effects_digests: DashMap::with_shard_amount(2048),
-            pending_transaction_writes: DashMap::with_shard_amount(2048),
-            fastpath_transaction_outputs: MokaCache::builder(8)
-                .max_capacity(randomize_cache_capacity_in_tests(
-                    config.fastpath_transaction_outputs_cache_size(),
-                ))
-                .build(),
-            transaction_events: DashMap::with_shard_amount(2048),
-            total_transaction_inserts: AtomicU64::new(0),
-            total_transaction_commits: AtomicU64::new(0),
-        }
-    }
-
-    fn clear(&self) {
-        self.objects.clear();
-        self.markers.clear();
-        self.transaction_effects.clear();
-        self.executed_effects_digests.clear();
-        self.pending_transaction_writes.clear();
-        self.fastpath_transaction_outputs.invalidate_all();
-        self.transaction_events.clear();
-        self.total_transaction_inserts
-            .store(0, std::sync::atomic::Ordering::Relaxed);
-        self.total_transaction_commits
-            .store(0, std::sync::atomic::Ordering::Relaxed);
-    }
-
-    fn is_empty(&self) -> bool {
-        let empty = self.pending_transaction_writes.is_empty();
-        if empty && cfg!(debug_assertions) {
-            assert!(
-                self.objects.is_empty()
-                    && self.markers.is_empty()
-                    && self.transaction_effects.is_empty()
-                    && self.executed_effects_digests.is_empty()
-                    && self.transaction_events.is_empty()
-                    && self
-                        .total_transaction_inserts
-                        .load(std::sync::atomic::Ordering::Relaxed)
-                        == self
-                            .total_transaction_commits
-                            .load(std::sync::atomic::Ordering::Relaxed),
-            );
-        }
-        empty
-    }
-}
-
-// Point items (anything without a version number) can be negatively cached as None
-type PointCacheItem<T> = Option<T>;
-
-// PointCacheItem can only be used for insert-only collections, so a Some entry
-// is always newer than a None entry.
-impl<T: Eq + std::fmt::Debug> IsNewer for PointCacheItem<T> {
-    fn is_newer_than(&self, other: &PointCacheItem<T>) -> bool {
-        match (self, other) {
-            (Some(_), None) => true,
-
-            (Some(a), Some(b)) => {
-                // conflicting inserts should never happen
-                debug_assert_eq!(a, b);
-                false
-            }
-
-            _ => false,
-        }
-    }
-}
-
-/// CachedData stores data that has been committed to the db, but is likely to be read soon.
-struct CachedCommittedData {
-    // See module level comment for an explanation of caching strategy.
-    object_cache: MokaCache<ObjectID, Arc<Mutex<CachedVersionMap<ObjectEntry>>>>,
-
-    // See module level comment for an explanation of caching strategy.
-    marker_cache: MokaCache<MarkerKey, Arc<Mutex<CachedVersionMap<MarkerValue>>>>,
-
-    transactions: MonotonicCache<TransactionDigest, PointCacheItem<Arc<VerifiedTransaction>>>,
-
-    transaction_effects:
-        MonotonicCache<TransactionEffectsDigest, PointCacheItem<Arc<TransactionEffects>>>,
-
-    transaction_events: MonotonicCache<TransactionDigest, PointCacheItem<Arc<TransactionEvents>>>,
-
-    executed_effects_digests:
-        MonotonicCache<TransactionDigest, PointCacheItem<TransactionEffectsDigest>>,
-
-    // Objects that were read at transaction signing time - allows us to access them again at
-    // execution time with a single lock / hash lookup
-    _transaction_objects: MokaCache<TransactionDigest, Vec<Object>>,
-}
-
-impl CachedCommittedData {
-    fn new(config: &ExecutionCacheConfig) -> Self {
-        let object_cache = MokaCache::builder(8)
-            .max_capacity(randomize_cache_capacity_in_tests(
-                config.object_cache_size(),
-            ))
-            .build();
-        let marker_cache = MokaCache::builder(8)
-            .max_capacity(randomize_cache_capacity_in_tests(
-                config.marker_cache_size(),
-            ))
-            .build();
-
-        let transactions = MonotonicCache::new(randomize_cache_capacity_in_tests(
-            config.transaction_cache_size(),
-        ));
-        let transaction_effects = MonotonicCache::new(randomize_cache_capacity_in_tests(
-            config.effect_cache_size(),
-        ));
-        let transaction_events = MonotonicCache::new(randomize_cache_capacity_in_tests(
-            config.events_cache_size(),
-        ));
-        let executed_effects_digests = MonotonicCache::new(randomize_cache_capacity_in_tests(
-            config.executed_effect_cache_size(),
-        ));
-
-        let transaction_objects = MokaCache::builder(8)
-            .max_capacity(randomize_cache_capacity_in_tests(
-                config.transaction_objects_cache_size(),
-            ))
-            .build();
-
-        Self {
-            object_cache,
-            marker_cache,
-            transactions,
-            transaction_effects,
-            transaction_events,
-            executed_effects_digests,
-            _transaction_objects: transaction_objects,
-        }
-    }
-
-    fn clear_and_assert_empty(&self) {
-        self.object_cache.invalidate_all();
-        self.marker_cache.invalidate_all();
-        self.transactions.invalidate_all();
-        self.transaction_effects.invalidate_all();
-        self.transaction_events.invalidate_all();
-        self.executed_effects_digests.invalidate_all();
-        self._transaction_objects.invalidate_all();
-
-        assert_empty(&self.object_cache);
-        assert_empty(&self.marker_cache);
-        assert!(self.transactions.is_empty());
-        assert!(self.transaction_effects.is_empty());
-        assert!(self.transaction_events.is_empty());
-        assert!(self.executed_effects_digests.is_empty());
-        assert_empty(&self._transaction_objects);
-    }
-}
-
-fn assert_empty<K, V>(cache: &MokaCache<K, V>)
-where
-    K: std::hash::Hash + std::cmp::Eq + std::cmp::PartialEq + Send + Sync + 'static,
-    V: std::clone::Clone + std::marker::Send + std::marker::Sync + 'static,
-{
-    if cache.iter().next().is_some() {
-        panic!("cache should be empty");
-    }
-}
+use tracing::{info, instrument, trace, warn};
 
 pub struct ReadonlyWritebackCache {
     dirty: UncommittedData,
@@ -448,53 +75,16 @@ pub struct ReadonlyWritebackCache {
     fastpath_transaction_outputs_notify_read:
         NotifyRead<TransactionDigest, Arc<TransactionOutputs>>,
 
-    store: Arc<AuthorityStore>,
+    store: Arc<ReadonlyAuthorityStore>,
     backpressure_threshold: u64,
     backpressure_manager: Arc<BackpressureManager>,
     metrics: Arc<ExecutionCacheMetrics>,
 }
 
-macro_rules! check_cache_entry_by_version {
-    ($self: ident, $table: expr, $level: expr, $cache: expr, $version: expr) => {
-        $self.metrics.record_cache_request($table, $level);
-        if let Some(cache) = $cache {
-            if let Some(entry) = cache.get(&$version) {
-                $self.metrics.record_cache_hit($table, $level);
-                return CacheResult::Hit(entry.clone());
-            }
-
-            if let Some(least_version) = cache.get_least() {
-                if least_version.0 < $version {
-                    // If the version is greater than the least version in the cache, then we know
-                    // that the object does not exist anywhere
-                    $self.metrics.record_cache_negative_hit($table, $level);
-                    return CacheResult::NegativeHit;
-                }
-            }
-        }
-        $self.metrics.record_cache_miss($table, $level);
-    };
-}
-
-macro_rules! check_cache_entry_by_latest {
-    ($self: ident, $table: expr, $level: expr, $cache: expr) => {
-        $self.metrics.record_cache_request($table, $level);
-        if let Some(cache) = $cache {
-            if let Some((version, entry)) = cache.get_highest() {
-                $self.metrics.record_cache_hit($table, $level);
-                return CacheResult::Hit((*version, entry.clone()));
-            } else {
-                panic!("empty CachedVersionMap should have been removed");
-            }
-        }
-        $self.metrics.record_cache_miss($table, $level);
-    };
-}
-
 impl ReadonlyWritebackCache {
     pub fn new(
         config: &ExecutionCacheConfig,
-        store: Arc<AuthorityStore>,
+        store: Arc<ReadonlyAuthorityStore>,
         metrics: Arc<ExecutionCacheMetrics>,
         backpressure_manager: Arc<BackpressureManager>,
     ) -> Self {
@@ -518,113 +108,6 @@ impl ReadonlyWritebackCache {
             backpressure_manager,
             backpressure_threshold: config.backpressure_threshold(),
             metrics,
-        }
-    }
-
-    pub fn new_for_tests(store: Arc<AuthorityStore>) -> Self {
-        Self::new(
-            &Default::default(),
-            store,
-            ExecutionCacheMetrics::new(&prometheus::Registry::new()).into(),
-            BackpressureManager::new_for_tests(),
-        )
-    }
-
-    #[cfg(test)]
-    pub fn reset_for_test(&mut self) {
-        let mut new = Self::new(
-            &Default::default(),
-            self.store.clone(),
-            self.metrics.clone(),
-            self.backpressure_manager.clone(),
-        );
-        std::mem::swap(self, &mut new);
-    }
-
-    fn write_object_entry(
-        &self,
-        object_id: &ObjectID,
-        version: SequenceNumber,
-        object: ObjectEntry,
-    ) {
-        trace!(?object_id, ?version, ?object, "inserting object entry");
-        self.metrics.record_cache_write("object");
-
-        // We must hold the lock for the object entry while inserting to the
-        // object_by_id_cache. Otherwise, a surprising bug can occur:
-        //
-        // 1. A thread executing TX1 can write object (O,1) to the dirty set and then pause.
-        // 2. TX2, which reads (O,1) can begin executing, because TransactionManager immediately
-        //    schedules transactions if their inputs are available. It does not matter that TX1
-        //    hasn't finished executing yet.
-        // 3. TX2 can write (O,2) to both the dirty set and the object_by_id_cache.
-        // 4. The thread executing TX1 can resume and write (O,1) to the object_by_id_cache.
-        //
-        // Now, any subsequent attempt to get the latest version of O will return (O,1) instead of
-        // (O,2).
-        //
-        // This seems very unlikely, but it may be possible under the following circumstances:
-        // - While a thread is unlikely to pause for so long, moka cache uses optimistic
-        //   lock-free algorithms that have retry loops. Possibly, under high contention, this
-        //   code might spin for a surprisingly long time.
-        // - Additionally, many concurrent re-executions of the same tx could happen due to
-        //   the tx finalizer, plus checkpoint executor, consensus, and RPCs from fullnodes.
-        let mut entry = self.dirty.objects.entry(*object_id).or_default();
-
-        self.object_by_id_cache
-            .insert(
-                object_id,
-                LatestObjectCacheEntry::Object(version, object.clone()),
-                Ticket::Write,
-            )
-            // While Ticket::Write cannot expire, this insert may still fail.
-            // See the comment in `MonotonicCache::insert`.
-            .ok();
-
-        entry.insert(version, object.clone());
-
-        if let ObjectEntry::Object(object) = &object {
-            if object.is_package() {
-                self.object_notify_read
-                    .notify(&InputKey::Package { id: *object_id }, &());
-            } else if !object.is_child_object() {
-                self.object_notify_read.notify(
-                    &InputKey::VersionedObject {
-                        id: object.full_id(),
-                        version: object.version(),
-                    },
-                    &(),
-                );
-            }
-        }
-    }
-
-    fn write_marker_value(
-        &self,
-        epoch_id: EpochId,
-        object_key: FullObjectKey,
-        marker_value: MarkerValue,
-    ) {
-        tracing::trace!("inserting marker value {object_key:?}: {marker_value:?}",);
-        self.metrics.record_cache_write("marker");
-        self.dirty
-            .markers
-            .entry((epoch_id, object_key.id()))
-            .or_default()
-            .value_mut()
-            .insert(object_key.version(), marker_value);
-        // It is possible for a transaction to use a consensus stream ended
-        // object in the input, hence we must notify that it is now available
-        // at the assigned version, so that any transaction waiting for this
-        // object version can start execution.
-        if matches!(marker_value, MarkerValue::ConsensusStreamEnded(_)) {
-            self.object_notify_read.notify(
-                &InputKey::VersionedObject {
-                    id: object_key.id(),
-                    version: object_key.version(),
-                },
-                &(),
-            );
         }
     }
 
@@ -875,114 +358,19 @@ impl ReadonlyWritebackCache {
         }
     }
 
-    fn record_db_get(&self, request_type: &'static str) -> &AuthorityStore {
+    fn record_db_get(&self, request_type: &'static str) -> &ReadonlyAuthorityStore {
         self.metrics.record_cache_request(request_type, "db");
         &self.store
     }
 
-    fn record_db_multi_get(&self, request_type: &'static str, count: usize) -> &AuthorityStore {
+    fn record_db_multi_get(
+        &self,
+        request_type: &'static str,
+        count: usize,
+    ) -> &ReadonlyAuthorityStore {
         self.metrics
             .record_cache_multi_request(request_type, "db", count);
         &self.store
-    }
-
-    #[instrument(level = "debug", skip_all)]
-    fn write_transaction_outputs(&self, epoch_id: EpochId, tx_outputs: Arc<TransactionOutputs>) {
-        trace!(digest = ?tx_outputs.transaction.digest(), "writing transaction outputs to cache");
-
-        let TransactionOutputs {
-            transaction,
-            effects,
-            markers,
-            written,
-            deleted,
-            wrapped,
-            events,
-            ..
-        } = &*tx_outputs;
-
-        // Deletions and wraps must be written first. The reason is that one of the deletes
-        // may be a child object, and if we write the parent object first, a reader may or may
-        // not see the previous version of the child object, instead of the deleted/wrapped
-        // tombstone, which would cause an execution fork
-        for ObjectKey(id, version) in deleted.iter() {
-            self.write_object_entry(id, *version, ObjectEntry::Deleted);
-        }
-
-        for ObjectKey(id, version) in wrapped.iter() {
-            self.write_object_entry(id, *version, ObjectEntry::Wrapped);
-        }
-
-        // Update all markers
-        for (object_key, marker_value) in markers.iter() {
-            self.write_marker_value(epoch_id, *object_key, *marker_value);
-        }
-
-        // Write children before parents to ensure that readers do not observe a parent object
-        // before its most recent children are visible.
-        for (object_id, object) in written.iter() {
-            if object.is_child_object() {
-                self.write_object_entry(object_id, object.version(), object.clone().into());
-            }
-        }
-        for (object_id, object) in written.iter() {
-            if !object.is_child_object() {
-                self.write_object_entry(object_id, object.version(), object.clone().into());
-                if object.is_package() {
-                    debug!("caching package: {:?}", object.compute_object_reference());
-                    self.packages
-                        .insert(*object_id, PackageObject::new(object.clone()));
-                }
-            }
-        }
-
-        let tx_digest = *transaction.digest();
-        let effects_digest = effects.digest();
-
-        self.metrics.record_cache_write("transaction_block");
-        self.dirty
-            .pending_transaction_writes
-            .insert(tx_digest, tx_outputs.clone());
-
-        // insert transaction effects before executed_effects_digests so that there
-        // are never dangling entries in executed_effects_digests
-        self.metrics.record_cache_write("transaction_effects");
-        self.dirty
-            .transaction_effects
-            .insert(effects_digest, effects.clone());
-
-        // note: if events.data.is_empty(), then there are no events for this transaction. We
-        // store it anyway to avoid special cases in commint_transaction_outputs, and translate
-        // an empty events structure to None when reading.
-        self.metrics.record_cache_write("transaction_events");
-        self.dirty
-            .transaction_events
-            .insert(tx_digest, events.clone());
-
-        self.metrics.record_cache_write("executed_effects_digests");
-        self.dirty
-            .executed_effects_digests
-            .insert(tx_digest, effects_digest);
-
-        self.executed_effects_digests_notify_read
-            .notify(&tx_digest, &effects_digest);
-
-        self.metrics
-            .pending_notify_read
-            .set(self.executed_effects_digests_notify_read.num_pending() as i64);
-
-        let prev = self
-            .dirty
-            .total_transaction_inserts
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-
-        let pending_count = (prev + 1).saturating_sub(
-            self.dirty
-                .total_transaction_commits
-                .load(std::sync::atomic::Ordering::Relaxed),
-        );
-
-        self.set_backpressure(pending_count);
     }
 
     fn build_db_batch(&self, epoch: EpochId, digests: &[TransactionDigest]) -> Batch {
@@ -1011,52 +399,6 @@ impl ReadonlyWritebackCache {
             .build_db_batch(epoch, &all_outputs)
             .expect("db error");
         (all_outputs, batch)
-    }
-
-    // Commits dirty data for the given TransactionDigest to the db.
-    #[instrument(level = "debug", skip_all)]
-    fn commit_transaction_outputs(
-        &self,
-        epoch: EpochId,
-        (all_outputs, db_batch): Batch,
-        digests: &[TransactionDigest],
-    ) {
-        let _metrics_guard =
-            mysten_metrics::monitored_scope("WritebackCache::commit_transaction_outputs");
-        fail_point!("writeback-cache-commit");
-        trace!(?digests);
-
-        // Flush writes to disk before removing anything from dirty set. otherwise,
-        // a cache eviction could cause a value to disappear briefly, even if we insert to the
-        // cache before removing from the dirty set.
-        db_batch.write().expect("db error");
-
-        let _metrics_guard =
-            mysten_metrics::monitored_scope("WritebackCache::commit_transaction_outputs::flush");
-        for outputs in all_outputs.iter() {
-            let tx_digest = outputs.transaction.digest();
-            assert!(self
-                .dirty
-                .pending_transaction_writes
-                .remove(tx_digest)
-                .is_some());
-            self.flush_transactions_from_dirty_to_cached(epoch, *tx_digest, outputs);
-        }
-
-        let num_outputs = all_outputs.len() as u64;
-        let num_commits = self
-            .dirty
-            .total_transaction_commits
-            .fetch_add(num_outputs, std::sync::atomic::Ordering::Relaxed)
-            + num_outputs;
-
-        let pending_count = self
-            .dirty
-            .total_transaction_inserts
-            .load(std::sync::atomic::Ordering::Relaxed)
-            .saturating_sub(num_commits);
-
-        self.set_backpressure(pending_count);
     }
 
     fn approximate_pending_transaction_count(&self) -> u64 {
@@ -1155,7 +497,7 @@ impl ReadonlyWritebackCache {
 
         // Move dirty markers to cache
         for (object_key, marker_value) in markers.iter() {
-            Self::move_version_from_dirty_to_cache(
+            WritebackCache::move_version_from_dirty_to_cache(
                 &self.dirty.markers,
                 &self.cached.marker_cache,
                 (epoch, object_key.id()),
@@ -1165,7 +507,7 @@ impl ReadonlyWritebackCache {
         }
 
         for (object_id, object) in written.iter() {
-            Self::move_version_from_dirty_to_cache(
+            WritebackCache::move_version_from_dirty_to_cache(
                 &self.dirty.objects,
                 &self.cached.object_cache,
                 *object_id,
@@ -1175,7 +517,7 @@ impl ReadonlyWritebackCache {
         }
 
         for ObjectKey(object_id, version) in deleted.iter() {
-            Self::move_version_from_dirty_to_cache(
+            WritebackCache::move_version_from_dirty_to_cache(
                 &self.dirty.objects,
                 &self.cached.object_cache,
                 *object_id,
@@ -1185,52 +527,13 @@ impl ReadonlyWritebackCache {
         }
 
         for ObjectKey(object_id, version) in wrapped.iter() {
-            Self::move_version_from_dirty_to_cache(
+            WritebackCache::move_version_from_dirty_to_cache(
                 &self.dirty.objects,
                 &self.cached.object_cache,
                 *object_id,
                 *version,
                 &ObjectEntry::Wrapped,
             );
-        }
-    }
-
-    // Move the oldest/least entry from the dirty queue to the cache queue.
-    // This is called after the entry is committed to the db.
-    fn move_version_from_dirty_to_cache<K, V>(
-        dirty: &DashMap<K, CachedVersionMap<V>>,
-        cache: &MokaCache<K, Arc<Mutex<CachedVersionMap<V>>>>,
-        key: K,
-        version: SequenceNumber,
-        value: &V,
-    ) where
-        K: Eq + std::hash::Hash + Clone + Send + Sync + Copy + 'static,
-        V: Send + Sync + Clone + Eq + std::fmt::Debug + 'static,
-    {
-        static MAX_VERSIONS: usize = 3;
-
-        // IMPORTANT: lock both the dirty set entry and the cache entry before modifying either.
-        // this ensures that readers cannot see a value temporarily disappear.
-        let dirty_entry = dirty.entry(key);
-        let cache_entry = cache.entry(key).or_default();
-        let mut cache_map = cache_entry.value().lock();
-
-        // insert into cache and drop old versions.
-        cache_map.insert(version, value.clone());
-        // TODO: make this automatic by giving CachedVersionMap an optional max capacity
-        cache_map.truncate_to(MAX_VERSIONS);
-
-        let DashMapEntry::Occupied(mut occupied_dirty_entry) = dirty_entry else {
-            panic!("dirty map must exist");
-        };
-
-        let removed = occupied_dirty_entry.get_mut().pop_oldest(&version);
-
-        assert_eq!(removed.as_ref(), Some(value), "dirty version must exist");
-
-        // if there are no versions remaining, remove the map entry
-        if occupied_dirty_entry.get().is_empty() {
-            occupied_dirty_entry.remove();
         }
     }
 
@@ -1301,22 +604,6 @@ impl ReadonlyWritebackCache {
         }
 
         // Note: individual object entries are removed when clear_state_end_of_epoch_impl is called
-    }
-
-    fn bulk_insert_genesis_objects_impl(&self, objects: &[Object]) {
-        self.store
-            .bulk_insert_genesis_objects(objects)
-            .expect("db error");
-        for obj in objects {
-            self.cached.object_cache.invalidate(&obj.id());
-            self.object_by_id_cache.invalidate(&obj.id());
-        }
-    }
-
-    fn insert_genesis_object_impl(&self, object: Object) {
-        self.object_by_id_cache.invalidate(&object.id());
-        self.cached.object_cache.invalidate(&object.id());
-        self.store.insert_genesis_object(object).expect("db error");
     }
 
     pub fn clear_caches_and_assert_empty(&self) {
@@ -2128,5 +1415,3 @@ impl TransactionCacheRead for ReadonlyWritebackCache {
             .boxed()
     }
 }
-
-implement_readonly_passthrough_traits!(ReadonlyWritebackCache);

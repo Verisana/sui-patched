@@ -1,7 +1,7 @@
+use super::*;
 use crate::authority::authority_per_epoch_store::AuthorityPerEpochStore;
 use crate::authority::authority_store_types::{get_store_object, StoreObject, StoreObjectWrapper};
 use crate::authority::epoch_start_configuration::{EpochFlag, EpochStartConfiguration};
-use crate::global_state_hasher::GlobalStateHashStore;
 use crate::transaction_outputs::TransactionOutputs;
 use authority_store::{
     AuthorityStoreMetrics, LockDetailsDeprecated, LockDetailsWrapperDeprecated, SuiLockResult,
@@ -10,33 +10,26 @@ use authority_store::{
 use authority_store_tables::AuthorityPerpetualTablesReadOnly;
 use either::Either;
 use fastcrypto::hash::{HashFunction, MultisetHash};
-use futures::stream::FuturesUnordered;
 use itertools::izip;
+use mysten_common::sync::notify_read::NotifyRead;
+use std::iter;
 use std::ops::Not;
 use std::sync::Arc;
-use std::{iter, mem, thread};
 use sui_storage::mutex_table::{MutexGuard, MutexTable};
 use sui_types::digests::TransactionEventsDigest;
+use sui_types::effects::{TransactionEffects, TransactionEvents};
 use sui_types::error::UserInputError;
-use sui_types::execution::TypeLayoutStore;
 use sui_types::global_state_hash::GlobalStateHash;
 use sui_types::message_envelope::Message;
 use sui_types::storage::{FullObjectKey, MarkerValue, ObjectKey, ObjectOrTombstone, ObjectStore};
 use sui_types::sui_system_state::get_sui_system_state;
-use sui_types::{base_types::SequenceNumber, fp_bail, fp_ensure};
-use tokio::time::Instant;
+use sui_types::{base_types::SequenceNumber, fp_bail};
 use tracing::{debug, info, trace};
 use typed_store::traits::Map;
 use typed_store::{
     rocks::{DBBatch, DBMap},
     TypedStoreError,
 };
-
-use super::authority_store_tables::LiveObject;
-use super::*;
-use mysten_common::sync::notify_read::NotifyRead;
-use sui_types::effects::{TransactionEffects, TransactionEvents};
-use sui_types::gas_coin::TOTAL_SUPPLY_MIST;
 
 /// ALL_OBJ_VER determines whether we want to store all past
 /// versions of every object in the store. Authority doesn't store
@@ -1131,156 +1124,6 @@ impl ReadonlyAuthorityStore {
     /// If the intent is for testing, you can use AuthorityState:: get_sui_system_state_object_for_testing.
     pub fn get_sui_system_state_object_unsafe(&self) -> SuiResult<SuiSystemState> {
         get_sui_system_state(self.perpetual_tables.as_ref())
-    }
-
-    pub fn expensive_check_sui_conservation<T>(
-        self: &Arc<Self>,
-        type_layout_store: T,
-        old_epoch_store: &AuthorityPerEpochStore,
-    ) -> SuiResult
-    where
-        T: TypeLayoutStore + Send + Copy,
-    {
-        if !self.enable_epoch_sui_conservation_check {
-            return Ok(());
-        }
-
-        let executor = old_epoch_store.executor();
-        info!("Starting SUI conservation check. This may take a while..");
-        let cur_time = Instant::now();
-        let mut pending_objects = vec![];
-        let mut count = 0;
-        let mut size = 0;
-        let (mut total_sui, mut total_storage_rebate) = thread::scope(|s| {
-            let pending_tasks = FuturesUnordered::new();
-            for o in self.iter_live_object_set(false) {
-                match o {
-                    LiveObject::Normal(object) => {
-                        size += object.object_size_for_gas_metering();
-                        count += 1;
-                        pending_objects.push(object);
-                        if count % 1_000_000 == 0 {
-                            let mut task_objects = vec![];
-                            mem::swap(&mut pending_objects, &mut task_objects);
-                            pending_tasks.push(s.spawn(move || {
-                                let mut layout_resolver =
-                                    executor.type_layout_resolver(Box::new(type_layout_store));
-                                let mut total_storage_rebate = 0;
-                                let mut total_sui = 0;
-                                for object in task_objects {
-                                    total_storage_rebate += object.storage_rebate;
-                                    // get_total_sui includes storage rebate, however all storage rebate is
-                                    // also stored in the storage fund, so we need to subtract it here.
-                                    total_sui +=
-                                        object.get_total_sui(layout_resolver.as_mut()).unwrap()
-                                            - object.storage_rebate;
-                                }
-                                if count % 50_000_000 == 0 {
-                                    info!("Processed {} objects", count);
-                                }
-                                (total_sui, total_storage_rebate)
-                            }));
-                        }
-                    }
-                    LiveObject::Wrapped(_) => {
-                        unreachable!("Explicitly asked to not include wrapped tombstones")
-                    }
-                }
-            }
-            pending_tasks.into_iter().fold((0, 0), |init, result| {
-                let result = result.join().unwrap();
-                (init.0 + result.0, init.1 + result.1)
-            })
-        });
-        let mut layout_resolver = executor.type_layout_resolver(Box::new(type_layout_store));
-        for object in pending_objects {
-            total_storage_rebate += object.storage_rebate;
-            total_sui +=
-                object.get_total_sui(layout_resolver.as_mut()).unwrap() - object.storage_rebate;
-        }
-        info!(
-            "Scanned {} live objects, took {:?}",
-            count,
-            cur_time.elapsed()
-        );
-        self.metrics
-            .sui_conservation_live_object_count
-            .set(count as i64);
-        self.metrics
-            .sui_conservation_live_object_size
-            .set(size as i64);
-        self.metrics
-            .sui_conservation_check_latency
-            .set(cur_time.elapsed().as_secs() as i64);
-
-        // It is safe to call this function because we are in the middle of reconfiguration.
-        let system_state = self
-            .get_sui_system_state_object_unsafe()
-            .expect("Reading sui system state object cannot fail")
-            .into_sui_system_state_summary();
-        let storage_fund_balance = system_state.storage_fund_total_object_storage_rebates;
-        info!(
-            "Total SUI amount in the network: {}, storage fund balance: {}, total storage rebate: {} at beginning of epoch {}",
-            total_sui, storage_fund_balance, total_storage_rebate, system_state.epoch
-        );
-
-        let imbalance = (storage_fund_balance as i64) - (total_storage_rebate as i64);
-        self.metrics
-            .sui_conservation_storage_fund
-            .set(storage_fund_balance as i64);
-        self.metrics
-            .sui_conservation_storage_fund_imbalance
-            .set(imbalance);
-        self.metrics
-            .sui_conservation_imbalance
-            .set((total_sui as i128 - TOTAL_SUPPLY_MIST as i128) as i64);
-
-        if let Some(expected_imbalance) = self
-            .perpetual_tables
-            .expected_storage_fund_imbalance
-            .get(&())
-            .expect("DB read cannot fail")
-        {
-            fp_ensure!(
-                imbalance == expected_imbalance,
-                SuiError::from(
-                    format!(
-                        "Inconsistent state detected at epoch {}: total storage rebate: {}, storage fund balance: {}, expected imbalance: {}",
-                        system_state.epoch, total_storage_rebate, storage_fund_balance, expected_imbalance
-                    ).as_str()
-                )
-            );
-        } else {
-            self.perpetual_tables
-                .expected_storage_fund_imbalance
-                .insert(&(), &imbalance)
-                .expect("DB write cannot fail");
-        }
-
-        if let Some(expected_sui) = self
-            .perpetual_tables
-            .expected_network_sui_amount
-            .get(&())
-            .expect("DB read cannot fail")
-        {
-            fp_ensure!(
-                total_sui == expected_sui,
-                SuiError::from(
-                    format!(
-                        "Inconsistent state detected at epoch {}: total sui: {}, expecting {}",
-                        system_state.epoch, total_sui, expected_sui
-                    )
-                    .as_str()
-                )
-            );
-        } else {
-            self.perpetual_tables
-                .expected_network_sui_amount
-                .insert(&(), &total_sui)
-                .expect("DB write cannot fail");
-        }
-
-        Ok(())
     }
 }
 
