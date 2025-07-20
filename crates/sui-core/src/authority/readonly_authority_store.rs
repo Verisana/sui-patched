@@ -1,38 +1,27 @@
-// Copyright (c) Mysten Labs, Inc.
-// SPDX-License-Identifier: Apache-2.0
-
-use std::ops::Not;
-use std::sync::Arc;
-use std::{iter, mem, thread};
-
 use crate::authority::authority_per_epoch_store::AuthorityPerEpochStore;
-use crate::authority::authority_store_pruner::{
-    AuthorityStorePruner, AuthorityStorePruningMetrics, EPOCH_DURATION_MS_FOR_TESTING,
-};
 use crate::authority::authority_store_types::{get_store_object, StoreObject, StoreObjectWrapper};
 use crate::authority::epoch_start_configuration::{EpochFlag, EpochStartConfiguration};
 use crate::global_state_hasher::GlobalStateHashStore;
-use crate::rpc_index::RpcIndexStore;
 use crate::transaction_outputs::TransactionOutputs;
+use authority_store::{
+    AuthorityStoreMetrics, LockDetailsDeprecated, LockDetailsWrapperDeprecated, SuiLockResult,
+    NUM_SHARDS,
+};
 use authority_store_tables::AuthorityPerpetualTablesReadOnly;
 use either::Either;
-use fastcrypto::hash::{HashFunction, MultisetHash, Sha3_256};
+use fastcrypto::hash::{HashFunction, MultisetHash};
 use futures::stream::FuturesUnordered;
 use itertools::izip;
-use move_core_types::resolver::ModuleResolver;
-use serde::{Deserialize, Serialize};
-use sui_config::node::AuthorityStorePruningConfig;
-use sui_macros::fail_point_arg;
+use std::ops::Not;
+use std::sync::Arc;
+use std::{iter, mem, thread};
 use sui_storage::mutex_table::{MutexGuard, MutexTable};
 use sui_types::digests::TransactionEventsDigest;
 use sui_types::error::UserInputError;
 use sui_types::execution::TypeLayoutStore;
 use sui_types::global_state_hash::GlobalStateHash;
 use sui_types::message_envelope::Message;
-use sui_types::storage::{
-    get_module, BackingPackageStore, FullObjectKey, MarkerValue, ObjectKey, ObjectOrTombstone,
-    ObjectStore,
-};
+use sui_types::storage::{FullObjectKey, MarkerValue, ObjectKey, ObjectOrTombstone, ObjectStore};
 use sui_types::sui_system_state::get_sui_system_state;
 use sui_types::{base_types::SequenceNumber, fp_bail, fp_ensure};
 use tokio::time::Instant;
@@ -44,7 +33,7 @@ use typed_store::{
 };
 
 use super::authority_store_tables::LiveObject;
-use super::{authority_store_tables::AuthorityPerpetualTables, *};
+use super::*;
 use mysten_common::sync::notify_read::NotifyRead;
 use sui_types::effects::{TransactionEffects, TransactionEvents};
 use sui_types::gas_coin::TOTAL_SUPPLY_MIST;
@@ -70,61 +59,7 @@ pub struct ReadonlyAuthorityStore {
     metrics: AuthorityStoreMetrics,
 }
 
-pub type ExecutionLockReadGuard<'a> = tokio::sync::RwLockReadGuard<'a, EpochId>;
-pub type ExecutionLockWriteGuard<'a> = tokio::sync::RwLockWriteGuard<'a, EpochId>;
-
 impl ReadonlyAuthorityStore {
-    /// Open an authority store by directory path.
-    /// If the store is empty, initialize it using genesis.
-    pub async fn open(
-        perpetual_tables: Arc<AuthorityPerpetualTables>,
-        genesis: &Genesis,
-        config: &NodeConfig,
-        registry: &Registry,
-    ) -> SuiResult<Arc<Self>> {
-        let enable_epoch_sui_conservation_check = config
-            .expensive_safety_check_config
-            .enable_epoch_sui_conservation_check();
-
-        let epoch_start_configuration = if perpetual_tables.database_is_empty()? {
-            info!("Creating new epoch start config from genesis");
-
-            #[allow(unused_mut)]
-            let mut initial_epoch_flags = EpochFlag::default_flags_for_new_epoch(config);
-            fail_point_arg!("initial_epoch_flags", |flags: Vec<EpochFlag>| {
-                info!("Setting initial epoch flags to {:?}", flags);
-                initial_epoch_flags = flags;
-            });
-
-            let epoch_start_configuration = EpochStartConfiguration::new(
-                genesis.sui_system_object().into_epoch_start_state(),
-                *genesis.checkpoint().digest(),
-                &genesis.objects(),
-                initial_epoch_flags,
-            )?;
-            perpetual_tables.set_epoch_start_configuration(&epoch_start_configuration)?;
-            epoch_start_configuration
-        } else {
-            info!("Loading epoch start config from DB");
-            perpetual_tables
-                .epoch_start_configuration
-                .get(&())?
-                .expect("Epoch start configuration must be set in non-empty DB")
-        };
-        let cur_epoch = perpetual_tables.get_recovery_epoch_at_restart()?;
-        info!("Epoch start config: {:?}", epoch_start_configuration);
-        info!("Cur epoch: {:?}", cur_epoch);
-        let this = Self::open_inner(
-            genesis,
-            perpetual_tables,
-            enable_epoch_sui_conservation_check,
-            registry,
-        )
-        .await?;
-        this.update_epoch_flags_metrics(&[], epoch_start_configuration.flags());
-        Ok(this)
-    }
-
     pub fn update_epoch_flags_metrics(&self, old: &[EpochFlag], new: &[EpochFlag]) {
         for flag in old {
             self.metrics
@@ -158,84 +93,8 @@ impl ReadonlyAuthorityStore {
             .schedule_delete_all()?)
     }
 
-    pub async fn open_with_committee_for_testing(
-        perpetual_tables: Arc<AuthorityPerpetualTables>,
-        committee: &Committee,
-        genesis: &Genesis,
-    ) -> SuiResult<Arc<Self>> {
-        // TODO: Since we always start at genesis, the committee should be technically the same
-        // as the genesis committee.
-        assert_eq!(committee.epoch, 0);
-        Self::open_inner(genesis, perpetual_tables, true, &Registry::new()).await
-    }
-
-    async fn open_inner(
-        genesis: &Genesis,
-        perpetual_tables: Arc<AuthorityPerpetualTables>,
-        enable_epoch_sui_conservation_check: bool,
-        registry: &Registry,
-    ) -> SuiResult<Arc<Self>> {
-        let store = Arc::new(Self {
-            mutex_table: MutexTable::new(NUM_SHARDS),
-            perpetual_tables,
-            root_state_notify_read: NotifyRead::<
-                EpochId,
-                (CheckpointSequenceNumber, GlobalStateHash),
-            >::new(),
-            enable_epoch_sui_conservation_check,
-            metrics: AuthorityStoreMetrics::new(registry),
-        });
-        // Only initialize an empty database.
-        if store
-            .database_is_empty()
-            .expect("Database read should not fail at init.")
-        {
-            store
-                .bulk_insert_genesis_objects(genesis.objects())
-                .expect("Cannot bulk insert genesis objects");
-
-            // insert txn and effects of genesis
-            let transaction = VerifiedTransaction::new_unchecked(genesis.transaction().clone());
-
-            store
-                .perpetual_tables
-                .transactions
-                .insert(transaction.digest(), transaction.serializable_ref())
-                .unwrap();
-
-            store
-                .perpetual_tables
-                .effects
-                .insert(&genesis.effects().digest(), genesis.effects())
-                .unwrap();
-            // We don't insert the effects to executed_effects yet because the genesis tx hasn't but will be executed.
-            // This is important for fullnodes to be able to generate indexing data right now.
-
-            if genesis.effects().events_digest().is_some() {
-                store
-                    .perpetual_tables
-                    .events_2
-                    .insert(transaction.digest(), genesis.events())
-                    .unwrap();
-            }
-            let event_digests = genesis.events().digest();
-            let events = genesis
-                .events()
-                .data
-                .iter()
-                .enumerate()
-                .map(|(i, e)| ((event_digests, i), e));
-            store.perpetual_tables.events.multi_insert(events).unwrap();
-        }
-
-        Ok(store)
-    }
-
-    /// Open authority store without any operations that require
-    /// genesis, such as constructing EpochStartConfiguration
-    /// or inserting genesis objects.
-    pub fn open_no_genesis(
-        perpetual_tables: Arc<AuthorityPerpetualTables>,
+    pub fn open_readonly(
+        perpetual_tables: Arc<AuthorityPerpetualTablesReadOnly>,
         enable_epoch_sui_conservation_check: bool,
         registry: &Registry,
     ) -> SuiResult<Arc<Self>> {
@@ -620,66 +479,6 @@ impl ReadonlyAuthorityStore {
         Ok(())
     }
 
-    pub fn bulk_insert_live_objects(
-        perpetual_db: &AuthorityPerpetualTables,
-        live_objects: impl Iterator<Item = LiveObject>,
-        expected_sha3_digest: &[u8; 32],
-    ) -> SuiResult<()> {
-        let mut hasher = Sha3_256::default();
-        let mut batch = perpetual_db.objects.batch();
-        for object in live_objects {
-            hasher.update(object.object_reference().2.inner());
-            match object {
-                LiveObject::Normal(object) => {
-                    let store_object_wrapper = get_store_object(object.clone());
-                    batch.insert_batch(
-                        &perpetual_db.objects,
-                        std::iter::once((
-                            ObjectKey::from(object.compute_object_reference()),
-                            store_object_wrapper,
-                        )),
-                    )?;
-                    if !object.is_child_object() {
-                        Self::initialize_live_object_markers(
-                            &perpetual_db.live_owned_object_markers,
-                            &mut batch,
-                            &[object.compute_object_reference()],
-                            false, // is_force_reset
-                        )?;
-                    }
-                }
-                LiveObject::Wrapped(object_key) => {
-                    batch.insert_batch(
-                        &perpetual_db.objects,
-                        std::iter::once::<(ObjectKey, StoreObjectWrapper)>((
-                            object_key,
-                            StoreObject::Wrapped.into(),
-                        )),
-                    )?;
-                }
-            }
-        }
-        let sha3_digest = hasher.finalize().digest;
-        if *expected_sha3_digest != sha3_digest {
-            error!(
-                "Sha does not match! expected: {:?}, actual: {:?}",
-                expected_sha3_digest, sha3_digest
-            );
-            return Err(SuiError::from("Sha does not match"));
-        }
-        batch.write()?;
-        Ok(())
-    }
-
-    pub fn set_epoch_start_configuration(
-        &self,
-        epoch_start_configuration: &EpochStartConfiguration,
-    ) -> SuiResult {
-        self.perpetual_tables
-            .set_epoch_start_configuration(epoch_start_configuration)?;
-        Ok(())
-    }
-
     pub fn get_epoch_start_configuration(&self) -> SuiResult<Option<EpochStartConfiguration>> {
         Ok(self.perpetual_tables.epoch_start_configuration.get(&())?)
     }
@@ -1002,7 +801,7 @@ impl ReadonlyAuthorityStore {
         objects: &[ObjectRef],
         is_force_reset: bool,
     ) -> SuiResult {
-        AuthorityStore::initialize_live_object_markers(
+        ReadonlyAuthorityStore::initialize_live_object_markers(
             &self.perpetual_tables.live_owned_object_markers,
             write_batch,
             objects,
@@ -1483,263 +1282,9 @@ impl ReadonlyAuthorityStore {
 
         Ok(())
     }
-
-    /// This is a temporary method to be used when we enable simplified_unwrap_then_delete.
-    /// It re-accumulates state hash for the new epoch if simplified_unwrap_then_delete is enabled.
-    #[instrument(level = "error", skip_all)]
-    pub fn maybe_reaccumulate_state_hash(
-        &self,
-        cur_epoch_store: &AuthorityPerEpochStore,
-        new_protocol_version: ProtocolVersion,
-    ) {
-        let old_simplified_unwrap_then_delete = cur_epoch_store
-            .protocol_config()
-            .simplified_unwrap_then_delete();
-        let new_simplified_unwrap_then_delete =
-            ProtocolConfig::get_for_version(new_protocol_version, cur_epoch_store.get_chain())
-                .simplified_unwrap_then_delete();
-        // If in the new epoch the simplified_unwrap_then_delete is enabled for the first time,
-        // we re-accumulate state root.
-        let should_reaccumulate =
-            !old_simplified_unwrap_then_delete && new_simplified_unwrap_then_delete;
-        if !should_reaccumulate {
-            return;
-        }
-        info!("[Re-accumulate] simplified_unwrap_then_delete is enabled in the new protocol version, re-accumulating state hash");
-        let cur_time = Instant::now();
-        std::thread::scope(|s| {
-            let pending_tasks = FuturesUnordered::new();
-            // Shard the object IDs into different ranges so that we can process them in parallel.
-            // We divide the range into 2^BITS number of ranges. To do so we use the highest BITS bits
-            // to mark the starting/ending point of the range. For example, when BITS = 5, we
-            // divide the range into 32 ranges, and the first few ranges are:
-            // 00000000_.... to 00000111_....
-            // 00001000_.... to 00001111_....
-            // 00010000_.... to 00010111_....
-            // and etc.
-            const BITS: u8 = 5;
-            for index in 0u8..(1 << BITS) {
-                pending_tasks.push(s.spawn(move || {
-                    let mut id_bytes = [0; ObjectID::LENGTH];
-                    id_bytes[0] = index << (8 - BITS);
-                    let start_id = ObjectID::new(id_bytes);
-
-                    id_bytes[0] |= (1 << (8 - BITS)) - 1;
-                    for element in id_bytes.iter_mut().skip(1) {
-                        *element = u8::MAX;
-                    }
-                    let end_id = ObjectID::new(id_bytes);
-
-                    info!(
-                        "[Re-accumulate] Scanning object ID range {:?}..{:?}",
-                        start_id, end_id
-                    );
-                    let mut prev = (
-                        ObjectKey::min_for_id(&ObjectID::ZERO),
-                        StoreObjectWrapper::V1(StoreObject::Deleted),
-                    );
-                    let mut object_scanned: u64 = 0;
-                    let mut wrapped_objects_to_remove = vec![];
-                    for db_result in self.perpetual_tables.objects.safe_range_iter(
-                        ObjectKey::min_for_id(&start_id)..=ObjectKey::max_for_id(&end_id),
-                    ) {
-                        match db_result {
-                            Ok((object_key, object)) => {
-                                object_scanned += 1;
-                                if object_scanned % 100000 == 0 {
-                                    info!(
-                                        "[Re-accumulate] Task {}: object scanned: {}",
-                                        index, object_scanned,
-                                    );
-                                }
-                                if matches!(prev.1.inner(), StoreObject::Wrapped)
-                                    && object_key.0 != prev.0 .0
-                                {
-                                    wrapped_objects_to_remove
-                                        .push(WrappedObject::new(prev.0 .0, prev.0 .1));
-                                }
-
-                                prev = (object_key, object);
-                            }
-                            Err(err) => {
-                                warn!("Object iterator encounter RocksDB error {:?}", err);
-                                return Err(err);
-                            }
-                        }
-                    }
-                    if matches!(prev.1.inner(), StoreObject::Wrapped) {
-                        wrapped_objects_to_remove.push(WrappedObject::new(prev.0 .0, prev.0 .1));
-                    }
-                    info!(
-                        "[Re-accumulate] Task {}: object scanned: {}, wrapped objects: {}",
-                        index,
-                        object_scanned,
-                        wrapped_objects_to_remove.len(),
-                    );
-                    Ok((wrapped_objects_to_remove, object_scanned))
-                }));
-            }
-            let (last_checkpoint_of_epoch, cur_accumulator) = self
-                .get_root_state_hash_for_epoch(cur_epoch_store.epoch())
-                .expect("read cannot fail")
-                .expect("accumulator must exist");
-            let (accumulator, total_objects_scanned, total_wrapped_objects) =
-                pending_tasks.into_iter().fold(
-                    (cur_accumulator, 0u64, 0usize),
-                    |(mut accumulator, total_objects_scanned, total_wrapped_objects), task| {
-                        let (wrapped_objects_to_remove, object_scanned) =
-                            task.join().unwrap().unwrap();
-                        accumulator.remove_all(
-                            wrapped_objects_to_remove
-                                .iter()
-                                .map(|wrapped| bcs::to_bytes(wrapped).unwrap().to_vec())
-                                .collect::<Vec<Vec<u8>>>(),
-                        );
-                        (
-                            accumulator,
-                            total_objects_scanned + object_scanned,
-                            total_wrapped_objects + wrapped_objects_to_remove.len(),
-                        )
-                    },
-                );
-            info!(
-                "[Re-accumulate] Total objects scanned: {}, total wrapped objects: {}",
-                total_objects_scanned, total_wrapped_objects,
-            );
-            info!(
-                "[Re-accumulate] New accumulator value: {:?}",
-                accumulator.digest()
-            );
-            self.insert_state_hash_for_epoch(
-                cur_epoch_store.epoch(),
-                &last_checkpoint_of_epoch,
-                &accumulator,
-            )
-            .unwrap();
-        });
-        info!(
-            "[Re-accumulate] Re-accumulating took {}seconds",
-            cur_time.elapsed().as_secs()
-        );
-    }
-
-    pub async fn prune_objects_and_compact_for_testing(
-        &self,
-        checkpoint_store: &Arc<CheckpointStore>,
-        rpc_index: Option<&RpcIndexStore>,
-    ) {
-        let pruning_config = AuthorityStorePruningConfig {
-            num_epochs_to_retain: 0,
-            ..Default::default()
-        };
-        let _ = AuthorityStorePruner::prune_objects_for_eligible_epochs(
-            &self.perpetual_tables,
-            checkpoint_store,
-            rpc_index,
-            None,
-            pruning_config,
-            AuthorityStorePruningMetrics::new_for_test(),
-            EPOCH_DURATION_MS_FOR_TESTING,
-        )
-        .await;
-        let _ = AuthorityStorePruner::compact(&self.perpetual_tables);
-    }
-
-    #[cfg(test)]
-    pub async fn prune_objects_immediately_for_testing(
-        &self,
-        transaction_effects: Vec<TransactionEffects>,
-    ) -> anyhow::Result<()> {
-        let mut wb = self.perpetual_tables.objects.batch();
-
-        let mut object_keys_to_prune = vec![];
-        for effects in &transaction_effects {
-            for (object_id, seq_number) in effects.modified_at_versions() {
-                info!("Pruning object {:?} version {:?}", object_id, seq_number);
-                object_keys_to_prune.push(ObjectKey(object_id, seq_number));
-            }
-        }
-
-        wb.delete_batch(
-            &self.perpetual_tables.objects,
-            object_keys_to_prune.into_iter(),
-        )?;
-        wb.write()?;
-        Ok(())
-    }
-
-    // Counts the number of versions exist in object store for `object_id`. This includes tombstone.
-    #[cfg(msim)]
-    pub fn count_object_versions(&self, object_id: ObjectID) -> usize {
-        self.perpetual_tables
-            .objects
-            .safe_iter_with_bounds(
-                Some(ObjectKey(object_id, VersionNumber::MIN)),
-                Some(ObjectKey(object_id, VersionNumber::MAX)),
-            )
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap()
-            .len()
-    }
 }
 
-impl GlobalStateHashStore for AuthorityStore {
-    fn get_object_ref_prior_to_key_deprecated(
-        &self,
-        object_id: &ObjectID,
-        version: VersionNumber,
-    ) -> SuiResult<Option<ObjectRef>> {
-        self.get_object_ref_prior_to_key(object_id, version)
-    }
-
-    fn get_root_state_hash_for_epoch(
-        &self,
-        epoch: EpochId,
-    ) -> SuiResult<Option<(CheckpointSequenceNumber, GlobalStateHash)>> {
-        self.perpetual_tables
-            .root_state_hash_by_epoch
-            .get(&epoch)
-            .map_err(Into::into)
-    }
-
-    fn get_root_state_hash_for_highest_epoch(
-        &self,
-    ) -> SuiResult<Option<(EpochId, (CheckpointSequenceNumber, GlobalStateHash))>> {
-        Ok(self
-            .perpetual_tables
-            .root_state_hash_by_epoch
-            .reversed_safe_iter_with_bounds(None, None)?
-            .next()
-            .transpose()?)
-    }
-
-    fn insert_state_hash_for_epoch(
-        &self,
-        epoch: EpochId,
-        last_checkpoint_of_epoch: &CheckpointSequenceNumber,
-        acc: &GlobalStateHash,
-    ) -> SuiResult {
-        self.perpetual_tables
-            .root_state_hash_by_epoch
-            .insert(&epoch, &(*last_checkpoint_of_epoch, acc.clone()))?;
-        self.root_state_notify_read
-            .notify(&epoch, &(*last_checkpoint_of_epoch, acc.clone()));
-
-        Ok(())
-    }
-
-    fn iter_live_object_set(
-        &self,
-        include_wrapped_object: bool,
-    ) -> Box<dyn Iterator<Item = LiveObject> + '_> {
-        Box::new(
-            self.perpetual_tables
-                .iter_live_object_set(include_wrapped_object),
-        )
-    }
-}
-
-impl ObjectStore for AuthorityStore {
+impl ObjectStore for ReadonlyAuthorityStore {
     /// Read an object and return it, or Ok(None) if the object was not found.
     fn get_object(&self, object_id: &ObjectID) -> Option<Object> {
         self.perpetual_tables.as_ref().get_object(object_id)
@@ -1747,98 +1292,5 @@ impl ObjectStore for AuthorityStore {
 
     fn get_object_by_key(&self, object_id: &ObjectID, version: VersionNumber) -> Option<Object> {
         self.perpetual_tables.get_object_by_key(object_id, version)
-    }
-}
-
-/// A wrapper to make Orphan Rule happy
-pub struct ResolverWrapper {
-    pub resolver: Arc<dyn BackingPackageStore + Send + Sync>,
-    pub metrics: Arc<ResolverMetrics>,
-}
-
-impl ResolverWrapper {
-    pub fn new(
-        resolver: Arc<dyn BackingPackageStore + Send + Sync>,
-        metrics: Arc<ResolverMetrics>,
-    ) -> Self {
-        metrics.module_cache_size.set(0);
-        ResolverWrapper { resolver, metrics }
-    }
-
-    fn inc_cache_size_gauge(&self) {
-        // reset the gauge after a restart of the cache
-        let current = self.metrics.module_cache_size.get();
-        self.metrics.module_cache_size.set(current + 1);
-    }
-}
-
-impl ModuleResolver for ResolverWrapper {
-    type Error = SuiError;
-    fn get_module(&self, module_id: &ModuleId) -> Result<Option<Vec<u8>>, Self::Error> {
-        self.inc_cache_size_gauge();
-        get_module(&*self.resolver, module_id)
-    }
-}
-
-pub enum UpdateType {
-    Transaction(TransactionEffectsDigest),
-    Genesis,
-}
-
-pub type SuiLockResult = SuiResult<ObjectLockStatus>;
-
-#[derive(Debug, PartialEq, Eq)]
-pub enum ObjectLockStatus {
-    Initialized,
-    LockedToTx { locked_by_tx: LockDetailsDeprecated },
-    LockedAtDifferentVersion { locked_ref: ObjectRef },
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum LockDetailsWrapperDeprecated {
-    V1(LockDetailsV1Deprecated),
-}
-
-impl LockDetailsWrapperDeprecated {
-    pub fn migrate(self) -> Self {
-        // TODO: when there are multiple versions, we must iteratively migrate from version N to
-        // N+1 until we arrive at the latest version
-        self
-    }
-
-    // Always returns the most recent version. Older versions are migrated to the latest version at
-    // read time, so there is never a need to access older versions.
-    pub fn inner(&self) -> &LockDetailsDeprecated {
-        match self {
-            Self::V1(v1) => v1,
-
-            // can remove #[allow] when there are multiple versions
-            #[allow(unreachable_patterns)]
-            _ => panic!("lock details should have been migrated to latest version at read time"),
-        }
-    }
-    pub fn into_inner(self) -> LockDetailsDeprecated {
-        match self {
-            Self::V1(v1) => v1,
-
-            // can remove #[allow] when there are multiple versions
-            #[allow(unreachable_patterns)]
-            _ => panic!("lock details should have been migrated to latest version at read time"),
-        }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LockDetailsV1Deprecated {
-    pub epoch: EpochId,
-    pub tx_digest: TransactionDigest,
-}
-
-pub type LockDetailsDeprecated = LockDetailsV1Deprecated;
-
-impl From<LockDetailsDeprecated> for LockDetailsWrapperDeprecated {
-    fn from(details: LockDetailsDeprecated) -> Self {
-        // always use latest version.
-        LockDetailsWrapperDeprecated::V1(details)
     }
 }
