@@ -12,8 +12,8 @@ use crate::checkpoints::CheckpointStore;
 
 #[derive(Debug, Default, Copy, Clone)]
 pub struct Watermarks {
-    executed: CheckpointSequenceNumber,
-    certified: CheckpointSequenceNumber,
+    pub executed: CheckpointSequenceNumber,
+    pub certified: CheckpointSequenceNumber,
 }
 
 impl Watermarks {
