@@ -6,7 +6,7 @@ use super::WritebackCache;
 use super::{
     cache_types::{CacheResult, CachedVersionMap, MonotonicCache},
     object_locks::ObjectLocks,
-    Batch, ExecutionCacheCommit, ExecutionCacheMetrics, ObjectCacheRead, TransactionCacheRead,
+    Batch, ExecutionCacheMetrics, ObjectCacheRead, TransactionCacheRead,
 };
 use crate::authority::authority_per_epoch_store::AuthorityPerEpochStore;
 use crate::authority::authority_store::{
@@ -34,6 +34,7 @@ use sui_types::bridge::{get_bridge, Bridge};
 use sui_types::digests::{ObjectDigest, TransactionDigest, TransactionEffectsDigest};
 use sui_types::effects::{TransactionEffects, TransactionEvents};
 use sui_types::error::{SuiError, SuiResult, UserInputError};
+use sui_types::message_envelope::Message;
 use sui_types::messages_checkpoint::CheckpointSequenceNumber;
 use sui_types::object::Object;
 use sui_types::storage::{
