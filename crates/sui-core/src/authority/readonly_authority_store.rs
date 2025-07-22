@@ -1,6 +1,6 @@
 use super::*;
 use crate::authority::authority_per_epoch_store::AuthorityPerEpochStore;
-use authority_store::{AuthorityStoreMetrics, LockDetailsDeprecated, SuiLockResult};
+use authority_store::{LockDetailsDeprecated, SuiLockResult};
 use authority_store_tables::AuthorityPerpetualTablesReadOnly;
 use std::ops::Not;
 use std::sync::Arc;
@@ -25,7 +25,6 @@ pub struct ReadonlyAuthorityStore {
 impl ReadonlyAuthorityStore {
     pub fn open_readonly(
         perpetual_tables: Arc<AuthorityPerpetualTablesReadOnly>,
-        registry: &Registry,
     ) -> SuiResult<Arc<Self>> {
         let store = Arc::new(Self { perpetual_tables });
         Ok(store)
