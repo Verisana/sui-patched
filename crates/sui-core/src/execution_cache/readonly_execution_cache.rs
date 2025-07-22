@@ -1,5 +1,5 @@
 use super::readonly_writeback_cache::ReadonlyWritebackCache;
-use super::{ExecutionCacheMetrics, ObjectCacheRead, TransactionCacheRead};
+use super::{ExecutionCacheMetrics, ObjectCacheRead};
 use crate::authority::readonly_authority_store::ReadonlyAuthorityStore;
 use crate::implement_storage_traits;
 use prometheus::Registry;

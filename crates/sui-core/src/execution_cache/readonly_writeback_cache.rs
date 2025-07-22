@@ -1,21 +1,17 @@
 use super::cache_types::Ticket;
 use super::writeback_cache::{
-    CachedCommittedData, LatestObjectCacheEntry, ObjectEntry, PointCacheItem, UncommittedData,
+    CachedCommittedData, LatestObjectCacheEntry, ObjectEntry, UncommittedData,
 };
-use super::WritebackCache;
 use super::{
     cache_types::{CacheResult, CachedVersionMap, MonotonicCache},
     object_locks::ObjectLocks,
-    Batch, ExecutionCacheMetrics, ObjectCacheRead, TransactionCacheRead,
+    ExecutionCacheMetrics, ObjectCacheRead,
 };
 use crate::authority::authority_per_epoch_store::AuthorityPerEpochStore;
-use crate::authority::authority_store::{
-    ExecutionLockWriteGuard, LockDetailsDeprecated, ObjectLockStatus, SuiLockResult,
-};
+use crate::authority::authority_store::{LockDetailsDeprecated, ObjectLockStatus, SuiLockResult};
 use crate::authority::readonly_authority_store::ReadonlyAuthorityStore;
 use crate::execution_cache::writeback_cache::assert_empty;
 use crate::fallback_fetch::{do_fallback_lookup, do_fallback_lookup_fallible};
-use crate::transaction_outputs::TransactionOutputs;
 use crate::{check_cache_entry_by_latest, check_cache_entry_by_version};
 use dashmap::mapref::entry::Entry as DashMapEntry;
 use dashmap::DashMap;
@@ -30,17 +26,14 @@ use std::sync::Arc;
 use sui_config::ExecutionCacheConfig;
 use sui_types::base_types::{EpochId, FullObjectID, ObjectID, ObjectRef, SequenceNumber};
 use sui_types::bridge::{get_bridge, Bridge};
-use sui_types::digests::{ObjectDigest, TransactionDigest, TransactionEffectsDigest};
-use sui_types::effects::{TransactionEffects, TransactionEvents};
+use sui_types::digests::ObjectDigest;
 use sui_types::error::{SuiError, SuiResult, UserInputError};
-use sui_types::message_envelope::Message;
 use sui_types::messages_checkpoint::CheckpointSequenceNumber;
 use sui_types::object::Object;
 use sui_types::storage::{
     FullObjectKey, InputKey, MarkerValue, ObjectKey, ObjectOrTombstone, ObjectStore, PackageObject,
 };
 use sui_types::sui_system_state::{get_sui_system_state, SuiSystemState};
-use sui_types::transaction::VerifiedTransaction;
 use tap::TapOptional;
 use tracing::{info, instrument, trace, warn};
 
@@ -70,10 +63,7 @@ pub struct ReadonlyWritebackCache {
 
     object_locks: ObjectLocks,
 
-    executed_effects_digests_notify_read: NotifyRead<TransactionDigest, TransactionEffectsDigest>,
     object_notify_read: NotifyRead<InputKey, ()>,
-    fastpath_transaction_outputs_notify_read:
-        NotifyRead<TransactionDigest, Arc<TransactionOutputs>>,
 
     store: Arc<ReadonlyAuthorityStore>,
     metrics: Arc<ExecutionCacheMetrics>,
@@ -98,9 +88,7 @@ impl ReadonlyWritebackCache {
             )),
             packages,
             object_locks: ObjectLocks::new(),
-            executed_effects_digests_notify_read: NotifyRead::new(),
             object_notify_read: NotifyRead::new(),
-            fastpath_transaction_outputs_notify_read: NotifyRead::new(),
             store,
             metrics,
         }
@@ -899,305 +887,6 @@ impl ObjectCacheRead for ReadonlyWritebackCache {
                     .collect::<Vec<_>>()
             })
             .map(|_| ())
-            .boxed()
-    }
-}
-
-impl TransactionCacheRead for ReadonlyWritebackCache {
-    fn multi_get_transaction_blocks(
-        &self,
-        digests: &[TransactionDigest],
-    ) -> Vec<Option<Arc<VerifiedTransaction>>> {
-        let digests_and_tickets: Vec<_> = digests
-            .iter()
-            .map(|d| (*d, self.cached.transactions.get_ticket_for_read(d)))
-            .collect();
-        do_fallback_lookup(
-            &digests_and_tickets,
-            |(digest, _)| {
-                self.metrics
-                    .record_cache_request("transaction_block", "uncommitted");
-                if let Some(tx) = self.dirty.pending_transaction_writes.get(digest) {
-                    self.metrics
-                        .record_cache_hit("transaction_block", "uncommitted");
-                    return CacheResult::Hit(Some(tx.transaction.clone()));
-                }
-                self.metrics
-                    .record_cache_miss("transaction_block", "uncommitted");
-
-                self.metrics
-                    .record_cache_request("transaction_block", "committed");
-
-                match self
-                    .cached
-                    .transactions
-                    .get(digest)
-                    .map(|l| l.lock().clone())
-                {
-                    Some(PointCacheItem::Some(tx)) => {
-                        self.metrics
-                            .record_cache_hit("transaction_block", "committed");
-                        CacheResult::Hit(Some(tx))
-                    }
-                    Some(PointCacheItem::None) => CacheResult::NegativeHit,
-                    None => {
-                        self.metrics
-                            .record_cache_miss("transaction_block", "committed");
-
-                        CacheResult::Miss
-                    }
-                }
-            },
-            |remaining| {
-                let remaining_digests: Vec<_> = remaining.iter().map(|(d, _)| *d).collect();
-                let results: Vec<_> = self
-                    .record_db_multi_get("transaction_block", remaining.len())
-                    .multi_get_transaction_blocks(&remaining_digests)
-                    .expect("db error")
-                    .into_iter()
-                    .map(|o| o.map(Arc::new))
-                    .collect();
-                for ((digest, ticket), result) in remaining.iter().zip(results.iter()) {
-                    if result.is_none() {
-                        self.cached.transactions.insert(digest, None, *ticket).ok();
-                    }
-                }
-                results
-            },
-        )
-    }
-
-    fn multi_get_executed_effects_digests(
-        &self,
-        digests: &[TransactionDigest],
-    ) -> Vec<Option<TransactionEffectsDigest>> {
-        let digests_and_tickets: Vec<_> = digests
-            .iter()
-            .map(|d| {
-                (
-                    *d,
-                    self.cached.executed_effects_digests.get_ticket_for_read(d),
-                )
-            })
-            .collect();
-        do_fallback_lookup(
-            &digests_and_tickets,
-            |(digest, _)| {
-                self.metrics
-                    .record_cache_request("executed_effects_digests", "uncommitted");
-                if let Some(digest) = self.dirty.executed_effects_digests.get(digest) {
-                    self.metrics
-                        .record_cache_hit("executed_effects_digests", "uncommitted");
-                    return CacheResult::Hit(Some(*digest));
-                }
-                self.metrics
-                    .record_cache_miss("executed_effects_digests", "uncommitted");
-
-                self.metrics
-                    .record_cache_request("executed_effects_digests", "committed");
-                match self
-                    .cached
-                    .executed_effects_digests
-                    .get(digest)
-                    .map(|l| *l.lock())
-                {
-                    Some(PointCacheItem::Some(digest)) => {
-                        self.metrics
-                            .record_cache_hit("executed_effects_digests", "committed");
-                        CacheResult::Hit(Some(digest))
-                    }
-                    Some(PointCacheItem::None) => CacheResult::NegativeHit,
-                    None => {
-                        self.metrics
-                            .record_cache_miss("executed_effects_digests", "committed");
-                        CacheResult::Miss
-                    }
-                }
-            },
-            |remaining| {
-                let remaining_digests: Vec<_> = remaining.iter().map(|(d, _)| *d).collect();
-                let results = self
-                    .record_db_multi_get("executed_effects_digests", remaining.len())
-                    .multi_get_executed_effects_digests(&remaining_digests)
-                    .expect("db error");
-                for ((digest, ticket), result) in remaining.iter().zip(results.iter()) {
-                    if result.is_none() {
-                        self.cached
-                            .executed_effects_digests
-                            .insert(digest, None, *ticket)
-                            .ok();
-                    }
-                }
-                results
-            },
-        )
-    }
-
-    fn multi_get_effects(
-        &self,
-        digests: &[TransactionEffectsDigest],
-    ) -> Vec<Option<TransactionEffects>> {
-        let digests_and_tickets: Vec<_> = digests
-            .iter()
-            .map(|d| (*d, self.cached.transaction_effects.get_ticket_for_read(d)))
-            .collect();
-        do_fallback_lookup(
-            &digests_and_tickets,
-            |(digest, _)| {
-                self.metrics
-                    .record_cache_request("transaction_effects", "uncommitted");
-                if let Some(effects) = self.dirty.transaction_effects.get(digest) {
-                    self.metrics
-                        .record_cache_hit("transaction_effects", "uncommitted");
-                    return CacheResult::Hit(Some(effects.clone()));
-                }
-                self.metrics
-                    .record_cache_miss("transaction_effects", "uncommitted");
-
-                self.metrics
-                    .record_cache_request("transaction_effects", "committed");
-                match self
-                    .cached
-                    .transaction_effects
-                    .get(digest)
-                    .map(|l| l.lock().clone())
-                {
-                    Some(PointCacheItem::Some(effects)) => {
-                        self.metrics
-                            .record_cache_hit("transaction_effects", "committed");
-                        CacheResult::Hit(Some((*effects).clone()))
-                    }
-                    Some(PointCacheItem::None) => CacheResult::NegativeHit,
-                    None => {
-                        self.metrics
-                            .record_cache_miss("transaction_effects", "committed");
-                        CacheResult::Miss
-                    }
-                }
-            },
-            |remaining| {
-                let remaining_digests: Vec<_> = remaining.iter().map(|(d, _)| *d).collect();
-                let results = self
-                    .record_db_multi_get("transaction_effects", remaining.len())
-                    .multi_get_effects(remaining_digests.iter())
-                    .expect("db error");
-                for ((digest, ticket), result) in remaining.iter().zip(results.iter()) {
-                    if result.is_none() {
-                        self.cached
-                            .transaction_effects
-                            .insert(digest, None, *ticket)
-                            .ok();
-                    }
-                }
-                results
-            },
-        )
-    }
-
-    fn notify_read_executed_effects_digests<'a>(
-        &'a self,
-        digests: &'a [TransactionDigest],
-    ) -> BoxFuture<'a, Vec<TransactionEffectsDigest>> {
-        self.executed_effects_digests_notify_read
-            .read(digests, |digests| {
-                self.multi_get_executed_effects_digests(digests)
-            })
-            .boxed()
-    }
-
-    fn multi_get_events(
-        &self,
-        event_digests: &[TransactionDigest],
-    ) -> Vec<Option<TransactionEvents>> {
-        fn map_events(events: TransactionEvents) -> Option<TransactionEvents> {
-            if events.data.is_empty() {
-                None
-            } else {
-                Some(events)
-            }
-        }
-
-        let digests_and_tickets: Vec<_> = event_digests
-            .iter()
-            .map(|d| (*d, self.cached.transaction_events.get_ticket_for_read(d)))
-            .collect();
-        do_fallback_lookup(
-            &digests_and_tickets,
-            |(digest, _)| {
-                self.metrics
-                    .record_cache_request("transaction_events", "uncommitted");
-                if let Some(events) = self.dirty.transaction_events.get(digest).map(|e| e.clone()) {
-                    self.metrics
-                        .record_cache_hit("transaction_events", "uncommitted");
-
-                    return CacheResult::Hit(map_events(events));
-                }
-                self.metrics
-                    .record_cache_miss("transaction_events", "uncommitted");
-
-                self.metrics
-                    .record_cache_request("transaction_events", "committed");
-                match self
-                    .cached
-                    .transaction_events
-                    .get(digest)
-                    .map(|l| l.lock().clone())
-                {
-                    Some(PointCacheItem::Some(events)) => {
-                        self.metrics
-                            .record_cache_hit("transaction_events", "committed");
-                        CacheResult::Hit(map_events((*events).clone()))
-                    }
-                    Some(PointCacheItem::None) => CacheResult::NegativeHit,
-                    None => {
-                        self.metrics
-                            .record_cache_miss("transaction_events", "committed");
-
-                        CacheResult::Miss
-                    }
-                }
-            },
-            |remaining| {
-                let remaining_digests: Vec<_> = remaining.iter().map(|(d, _)| *d).collect();
-                let results = self
-                    .store
-                    .multi_get_events(&remaining_digests)
-                    .expect("db error");
-                for ((digest, ticket), result) in remaining.iter().zip(results.iter()) {
-                    if result.is_none() {
-                        self.cached
-                            .transaction_events
-                            .insert(digest, None, *ticket)
-                            .ok();
-                    }
-                }
-                results
-            },
-        )
-    }
-
-    fn is_tx_fastpath_executed(&self, tx_digest: &TransactionDigest) -> bool {
-        self.dirty
-            .fastpath_transaction_outputs
-            .contains_key(tx_digest)
-    }
-
-    fn notify_read_fastpath_transaction_outputs<'a>(
-        &'a self,
-        tx_digests: &'a [TransactionDigest],
-    ) -> BoxFuture<'a, Vec<Arc<TransactionOutputs>>> {
-        self.fastpath_transaction_outputs_notify_read
-            .read(tx_digests, |tx_digests| {
-                tx_digests
-                    .iter()
-                    .map(|tx_digest| {
-                        self.dirty
-                            .fastpath_transaction_outputs
-                            .get(tx_digest)
-                            .clone()
-                    })
-                    .collect()
-            })
             .boxed()
     }
 }
