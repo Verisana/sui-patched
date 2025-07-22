@@ -10,7 +10,6 @@ use super::{
 use crate::authority::authority_per_epoch_store::AuthorityPerEpochStore;
 use crate::authority::authority_store::{LockDetailsDeprecated, ObjectLockStatus, SuiLockResult};
 use crate::authority::readonly_authority_store::ReadonlyAuthorityStore;
-use crate::execution_cache::writeback_cache::assert_empty;
 use crate::fallback_fetch::{do_fallback_lookup, do_fallback_lookup_fallible};
 use crate::{check_cache_entry_by_latest, check_cache_entry_by_version};
 use dashmap::mapref::entry::Entry as DashMapEntry;

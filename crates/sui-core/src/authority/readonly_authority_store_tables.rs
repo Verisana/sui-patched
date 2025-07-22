@@ -3,7 +3,6 @@ use crate::authority::authority_store_types::{
     try_construct_object, StoreObject, StoreObjectValue, StoreObjectWrapper,
 };
 use authority_store_tables::{AuthorityPerpetualTablesReadOnly, LiveObject};
-use serde::{Deserialize, Serialize};
 use std::path::Path;
 use sui_types::base_types::SequenceNumber;
 use sui_types::effects::TransactionEffects;

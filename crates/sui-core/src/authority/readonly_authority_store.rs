@@ -1,28 +1,16 @@
 use super::*;
 use crate::authority::authority_per_epoch_store::AuthorityPerEpochStore;
-use crate::authority::authority_store_types::{get_store_object, StoreObject, StoreObjectWrapper};
-use crate::authority::epoch_start_configuration::{EpochFlag, EpochStartConfiguration};
-use crate::transaction_outputs::TransactionOutputs;
-use authority_store::{
-    AuthorityStoreMetrics, LockDetailsDeprecated, LockDetailsWrapperDeprecated, SuiLockResult,
-};
+use authority_store::{AuthorityStoreMetrics, LockDetailsDeprecated, SuiLockResult};
 use authority_store_tables::AuthorityPerpetualTablesReadOnly;
-use std::iter;
 use std::ops::Not;
 use std::sync::Arc;
 use sui_types::digests::TransactionEventsDigest;
 use sui_types::effects::{TransactionEffects, TransactionEvents};
 use sui_types::error::UserInputError;
-use sui_types::message_envelope::Message;
 use sui_types::storage::{FullObjectKey, MarkerValue, ObjectKey, ObjectOrTombstone, ObjectStore};
-use sui_types::sui_system_state::get_sui_system_state;
 use sui_types::{base_types::SequenceNumber, fp_bail};
-use tracing::{debug, info, trace};
 use typed_store::traits::Map;
-use typed_store::{
-    rocks::{DBBatch, DBMap},
-    TypedStoreError,
-};
+use typed_store::TypedStoreError;
 
 /// ALL_OBJ_VER determines whether we want to store all past
 /// versions of every object in the store. Authority doesn't store
@@ -32,7 +20,6 @@ use typed_store::{
 /// S allows SuiDataStore to either store the authority signed version or unsigned version.
 pub struct ReadonlyAuthorityStore {
     pub(crate) perpetual_tables: Arc<AuthorityPerpetualTablesReadOnly>,
-    metrics: AuthorityStoreMetrics,
 }
 
 impl ReadonlyAuthorityStore {
@@ -40,28 +27,8 @@ impl ReadonlyAuthorityStore {
         perpetual_tables: Arc<AuthorityPerpetualTablesReadOnly>,
         registry: &Registry,
     ) -> SuiResult<Arc<Self>> {
-        let store = Arc::new(Self {
-            perpetual_tables,
-            metrics: AuthorityStoreMetrics::new(registry),
-        });
+        let store = Arc::new(Self { perpetual_tables });
         Ok(store)
-    }
-
-    pub fn get_events(
-        &self,
-        digest: &TransactionDigest,
-    ) -> Result<Option<TransactionEvents>, TypedStoreError> {
-        // For now, during this transition period, if we don't find events for a particular
-        // Transaction we need to fallback to try and read from the older table. Once the migration
-        // has finished and we've removed the older events table we can stop doing the fallback
-        if let Some(events) = self.perpetual_tables.events_2.get(digest)? {
-            return Ok(Some(events));
-        }
-
-        self.get_executed_effects(digest)?
-            .and_then(|effects| effects.events_digest().copied())
-            .and_then(|events_digest| self.get_events_by_events_digest(&events_digest).transpose())
-            .transpose()
     }
 
     pub fn get_events_by_events_digest(
@@ -77,23 +44,6 @@ impl ReadonlyAuthorityStore {
         Ok(data.is_empty().not().then_some(TransactionEvents { data }))
     }
 
-    pub fn multi_get_events(
-        &self,
-        event_digests: &[TransactionDigest],
-    ) -> SuiResult<Vec<Option<TransactionEvents>>> {
-        Ok(event_digests
-            .iter()
-            .map(|digest| self.get_events(digest))
-            .collect::<Result<Vec<_>, _>>()?)
-    }
-
-    pub fn multi_get_effects<'a>(
-        &self,
-        effects_digests: impl Iterator<Item = &'a TransactionEffectsDigest>,
-    ) -> Result<Vec<Option<TransactionEffects>>, TypedStoreError> {
-        self.perpetual_tables.effects.multi_get(effects_digests)
-    }
-
     pub fn get_executed_effects(
         &self,
         tx_digest: &TransactionDigest,
@@ -103,15 +53,6 @@ impl ReadonlyAuthorityStore {
             Some(digest) => Ok(self.perpetual_tables.effects.get(&digest)?),
             None => Ok(None),
         }
-    }
-
-    /// Given a list of transaction digests, returns a list of the corresponding effects only if they have been
-    /// executed. For transactions that have not been executed, None is returned.
-    pub fn multi_get_executed_effects_digests(
-        &self,
-        digests: &[TransactionDigest],
-    ) -> Result<Vec<Option<TransactionEffectsDigest>>, TypedStoreError> {
-        self.perpetual_tables.executed_effects.multi_get(digests)
     }
 
     pub fn get_marker_value(
@@ -333,16 +274,6 @@ impl ReadonlyAuthorityStore {
             .expect("Non tombstone store object could not be converted to object");
 
         Ok(Some((object_key, ObjectOrTombstone::Object(object))))
-    }
-
-    pub fn multi_get_transaction_blocks(
-        &self,
-        tx_digests: &[TransactionDigest],
-    ) -> Result<Vec<Option<VerifiedTransaction>>, TypedStoreError> {
-        self.perpetual_tables
-            .transactions
-            .multi_get(tx_digests)
-            .map(|v| v.into_iter().map(|v| v.map(|v| v.into())).collect())
     }
 }
 
