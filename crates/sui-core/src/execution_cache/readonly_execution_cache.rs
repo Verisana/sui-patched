@@ -21,7 +21,6 @@ use sui_types::storage::{
 #[derive(Clone)]
 pub struct ReadonlyExecutionCacheTraitPointers {
     pub object_cache_reader: Arc<dyn ObjectCacheRead>,
-    pub transaction_cache_reader: Arc<dyn TransactionCacheRead>,
     pub backing_store: Arc<dyn BackingStore + Send + Sync>,
     pub backing_package_store: Arc<dyn BackingPackageStore + Send + Sync>,
     pub object_store: Arc<dyn ObjectStore + Send + Sync>,
@@ -30,16 +29,10 @@ pub struct ReadonlyExecutionCacheTraitPointers {
 impl ReadonlyExecutionCacheTraitPointers {
     pub fn new<T>(cache: Arc<T>) -> Self
     where
-        T: ObjectCacheRead
-            + TransactionCacheRead
-            + BackingStore
-            + BackingPackageStore
-            + ObjectStore
-            + 'static,
+        T: ObjectCacheRead + BackingStore + BackingPackageStore + ObjectStore + 'static,
     {
         Self {
             object_cache_reader: cache.clone(),
-            transaction_cache_reader: cache.clone(),
             backing_store: cache.clone(),
             backing_package_store: cache.clone(),
             object_store: cache.clone(),

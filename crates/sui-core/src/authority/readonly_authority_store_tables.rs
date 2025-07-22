@@ -2,7 +2,7 @@ use super::*;
 use crate::authority::authority_store_types::{
     try_construct_object, StoreObject, StoreObjectValue, StoreObjectWrapper,
 };
-use authority_store_tables::AuthorityPerpetualTablesReadOnly;
+use authority_store_tables::{AuthorityPerpetualTablesReadOnly, LiveObject};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use sui_types::base_types::SequenceNumber;
@@ -280,42 +280,6 @@ pub struct LiveSetIter<'a> {
     prev: Option<(ObjectKey, StoreObjectWrapper)>,
     /// Whether a wrapped object is considered as a live object.
     include_wrapped_object: bool,
-}
-
-#[derive(Eq, PartialEq, Debug, Clone, Deserialize, Serialize, Hash)]
-pub enum LiveObject {
-    Normal(Object),
-    Wrapped(ObjectKey),
-}
-
-impl LiveObject {
-    pub fn object_id(&self) -> ObjectID {
-        match self {
-            LiveObject::Normal(obj) => obj.id(),
-            LiveObject::Wrapped(key) => key.0,
-        }
-    }
-
-    pub fn version(&self) -> SequenceNumber {
-        match self {
-            LiveObject::Normal(obj) => obj.version(),
-            LiveObject::Wrapped(key) => key.1,
-        }
-    }
-
-    pub fn object_reference(&self) -> ObjectRef {
-        match self {
-            LiveObject::Normal(obj) => obj.compute_object_reference(),
-            LiveObject::Wrapped(key) => (key.0, key.1, ObjectDigest::OBJECT_DIGEST_WRAPPED),
-        }
-    }
-
-    pub fn to_normal(self) -> Option<Object> {
-        match self {
-            LiveObject::Normal(object) => Some(object),
-            LiveObject::Wrapped(_) => None,
-        }
-    }
 }
 
 impl LiveSetIter<'_> {
