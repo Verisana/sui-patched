@@ -35,7 +35,7 @@ use sui_types::storage::{
 };
 use sui_types::sui_system_state::{get_sui_system_state, SuiSystemState};
 use tap::TapOptional;
-use tracing::{info, instrument, trace, warn};
+use tracing::{instrument, trace, warn};
 
 pub struct ReadonlyWritebackCache {
     dirty: UncommittedData,
@@ -378,15 +378,6 @@ impl ReadonlyWritebackCache {
 
     fn cache_object_not_found(&self, object_id: &ObjectID, ticket: Ticket) {
         self.cache_latest_object_by_id(object_id, LatestObjectCacheEntry::NonExistent, ticket);
-    }
-
-    pub fn clear_caches_and_assert_empty(&self) {
-        info!("clearing caches");
-        self.cached.clear_and_assert_empty();
-        self.object_by_id_cache.invalidate_all();
-        assert!(&self.object_by_id_cache.is_empty());
-        self.packages.invalidate_all();
-        assert_empty(&self.packages);
     }
 }
 
