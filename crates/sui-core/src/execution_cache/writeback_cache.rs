@@ -102,7 +102,7 @@ pub mod writeback_cache_tests;
 mod notify_read_input_objects_tests;
 
 #[derive(Clone, PartialEq, Eq)]
-enum ObjectEntry {
+pub enum ObjectEntry {
     Object(Object),
     Deleted,
     Wrapped,
@@ -117,7 +117,7 @@ impl ObjectEntry {
         }
     }
 
-    fn is_tombstone(&self) -> bool {
+    pub fn is_tombstone(&self) -> bool {
         match self {
             ObjectEntry::Deleted | ObjectEntry::Wrapped => true,
             ObjectEntry::Object(_) => false,
@@ -161,7 +161,7 @@ impl From<ObjectOrTombstone> for ObjectEntry {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum LatestObjectCacheEntry {
+pub enum LatestObjectCacheEntry {
     Object(SequenceNumber, ObjectEntry),
     NonExistent,
 }
@@ -175,7 +175,7 @@ impl LatestObjectCacheEntry {
         }
     }
 
-    fn is_alive(&self) -> bool {
+    pub fn is_alive(&self) -> bool {
         match self {
             LatestObjectCacheEntry::Object(_, entry) => !entry.is_tombstone(),
             LatestObjectCacheEntry::NonExistent => false,
@@ -199,7 +199,7 @@ type MarkerKey = (EpochId, FullObjectID);
 
 /// UncommittedData stores execution outputs that are not yet written to the db. Entries in this
 /// struct can only be purged after they are committed.
-struct UncommittedData {
+pub struct UncommittedData {
     /// The object dirty set. All writes go into this table first. After we flush the data to the
     /// db, the data is removed from this table and inserted into the object_cache.
     ///
@@ -212,23 +212,23 @@ struct UncommittedData {
     /// reads efficient. `object_cache` cannot contain a more recent version of an object than
     /// `objects`, and neither can have any gaps. Therefore if there is any object <= the version
     /// bound for a child read in objects, it is the correct object to return.
-    objects: DashMap<ObjectID, CachedVersionMap<ObjectEntry>>,
+    pub objects: DashMap<ObjectID, CachedVersionMap<ObjectEntry>>,
 
     // Markers for received objects and deleted shared objects. This contains all of the dirty
     // marker state, which is committed to the db at the same time as other transaction data.
     // After markers are committed to the db we remove them from this table and insert them into
     // marker_cache.
-    markers: DashMap<MarkerKey, CachedVersionMap<MarkerValue>>,
+    pub markers: DashMap<MarkerKey, CachedVersionMap<MarkerValue>>,
 
-    transaction_effects: DashMap<TransactionEffectsDigest, TransactionEffects>,
+    pub transaction_effects: DashMap<TransactionEffectsDigest, TransactionEffects>,
 
-    transaction_events: DashMap<TransactionDigest, TransactionEvents>,
+    pub transaction_events: DashMap<TransactionDigest, TransactionEvents>,
 
-    executed_effects_digests: DashMap<TransactionDigest, TransactionEffectsDigest>,
+    pub executed_effects_digests: DashMap<TransactionDigest, TransactionEffectsDigest>,
 
     // Transaction outputs that have not yet been written to the DB. Items are removed from this
     // table as they are flushed to the db.
-    pending_transaction_writes: DashMap<TransactionDigest, Arc<TransactionOutputs>>,
+    pub pending_transaction_writes: DashMap<TransactionDigest, Arc<TransactionOutputs>>,
 
     // Transactions outputs from Mysticeti fastpath certified transaction executions.
     // These outputs are not written to pending_transaction_writes until we are sure
@@ -242,14 +242,14 @@ struct UncommittedData {
     // So we rely on the cache to evict them eventually.
     // It is also safe to evict a transaction that will eventually be finalized,
     // as we will just re-execute it.
-    fastpath_transaction_outputs: MokaCache<TransactionDigest, Arc<TransactionOutputs>>,
+    pub fastpath_transaction_outputs: MokaCache<TransactionDigest, Arc<TransactionOutputs>>,
 
-    total_transaction_inserts: AtomicU64,
-    total_transaction_commits: AtomicU64,
+    pub total_transaction_inserts: AtomicU64,
+    pub total_transaction_commits: AtomicU64,
 }
 
 impl UncommittedData {
-    fn new(config: &ExecutionCacheConfig) -> Self {
+    pub fn new(config: &ExecutionCacheConfig) -> Self {
         Self {
             objects: DashMap::with_shard_amount(2048),
             markers: DashMap::with_shard_amount(2048),
@@ -267,7 +267,7 @@ impl UncommittedData {
         }
     }
 
-    fn clear(&self) {
+    pub fn clear(&self) {
         self.objects.clear();
         self.markers.clear();
         self.transaction_effects.clear();
@@ -303,7 +303,7 @@ impl UncommittedData {
 }
 
 // Point items (anything without a version number) can be negatively cached as None
-type PointCacheItem<T> = Option<T>;
+pub type PointCacheItem<T> = Option<T>;
 
 // PointCacheItem can only be used for insert-only collections, so a Some entry
 // is always newer than a None entry.
@@ -324,21 +324,22 @@ impl<T: Eq + std::fmt::Debug> IsNewer for PointCacheItem<T> {
 }
 
 /// CachedData stores data that has been committed to the db, but is likely to be read soon.
-struct CachedCommittedData {
+pub struct CachedCommittedData {
     // See module level comment for an explanation of caching strategy.
-    object_cache: MokaCache<ObjectID, Arc<Mutex<CachedVersionMap<ObjectEntry>>>>,
+    pub object_cache: MokaCache<ObjectID, Arc<Mutex<CachedVersionMap<ObjectEntry>>>>,
 
     // See module level comment for an explanation of caching strategy.
-    marker_cache: MokaCache<MarkerKey, Arc<Mutex<CachedVersionMap<MarkerValue>>>>,
+    pub marker_cache: MokaCache<MarkerKey, Arc<Mutex<CachedVersionMap<MarkerValue>>>>,
 
-    transactions: MonotonicCache<TransactionDigest, PointCacheItem<Arc<VerifiedTransaction>>>,
+    pub transactions: MonotonicCache<TransactionDigest, PointCacheItem<Arc<VerifiedTransaction>>>,
 
-    transaction_effects:
+    pub transaction_effects:
         MonotonicCache<TransactionEffectsDigest, PointCacheItem<Arc<TransactionEffects>>>,
 
-    transaction_events: MonotonicCache<TransactionDigest, PointCacheItem<Arc<TransactionEvents>>>,
+    pub transaction_events:
+        MonotonicCache<TransactionDigest, PointCacheItem<Arc<TransactionEvents>>>,
 
-    executed_effects_digests:
+    pub executed_effects_digests:
         MonotonicCache<TransactionDigest, PointCacheItem<TransactionEffectsDigest>>,
 
     // Objects that were read at transaction signing time - allows us to access them again at
@@ -347,7 +348,7 @@ struct CachedCommittedData {
 }
 
 impl CachedCommittedData {
-    fn new(config: &ExecutionCacheConfig) -> Self {
+    pub fn new(config: &ExecutionCacheConfig) -> Self {
         let object_cache = MokaCache::builder(8)
             .max_capacity(randomize_cache_capacity_in_tests(
                 config.object_cache_size(),
@@ -389,7 +390,7 @@ impl CachedCommittedData {
         }
     }
 
-    fn clear_and_assert_empty(&self) {
+    pub fn clear_and_assert_empty(&self) {
         self.object_cache.invalidate_all();
         self.marker_cache.invalidate_all();
         self.transactions.invalidate_all();
@@ -408,7 +409,7 @@ impl CachedCommittedData {
     }
 }
 
-fn assert_empty<K, V>(cache: &MokaCache<K, V>)
+pub fn assert_empty<K, V>(cache: &MokaCache<K, V>)
 where
     K: std::hash::Hash + std::cmp::Eq + std::cmp::PartialEq + Send + Sync + 'static,
     V: std::clone::Clone + std::marker::Send + std::marker::Sync + 'static,
@@ -455,6 +456,7 @@ pub struct WritebackCache {
     metrics: Arc<ExecutionCacheMetrics>,
 }
 
+#[macro_export]
 macro_rules! check_cache_entry_by_version {
     ($self: ident, $table: expr, $level: expr, $cache: expr, $version: expr) => {
         $self.metrics.record_cache_request($table, $level);
@@ -477,6 +479,7 @@ macro_rules! check_cache_entry_by_version {
     };
 }
 
+#[macro_export]
 macro_rules! check_cache_entry_by_latest {
     ($self: ident, $table: expr, $level: expr, $cache: expr) => {
         $self.metrics.record_cache_request($table, $level);
@@ -1198,7 +1201,7 @@ impl WritebackCache {
 
     // Move the oldest/least entry from the dirty queue to the cache queue.
     // This is called after the entry is committed to the db.
-    fn move_version_from_dirty_to_cache<K, V>(
+    pub fn move_version_from_dirty_to_cache<K, V>(
         dirty: &DashMap<K, CachedVersionMap<V>>,
         cache: &MokaCache<K, Arc<Mutex<CachedVersionMap<V>>>>,
         key: K,

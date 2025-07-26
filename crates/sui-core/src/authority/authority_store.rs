@@ -48,16 +48,16 @@ use mysten_common::sync::notify_read::NotifyRead;
 use sui_types::effects::{TransactionEffects, TransactionEvents};
 use sui_types::gas_coin::TOTAL_SUPPLY_MIST;
 
-const NUM_SHARDS: usize = 4096;
+pub const NUM_SHARDS: usize = 4096;
 
-struct AuthorityStoreMetrics {
-    sui_conservation_check_latency: IntGauge,
-    sui_conservation_live_object_count: IntGauge,
-    sui_conservation_live_object_size: IntGauge,
-    sui_conservation_imbalance: IntGauge,
-    sui_conservation_storage_fund: IntGauge,
-    sui_conservation_storage_fund_imbalance: IntGauge,
-    epoch_flags: IntGaugeVec,
+pub struct AuthorityStoreMetrics {
+    pub sui_conservation_check_latency: IntGauge,
+    pub sui_conservation_live_object_count: IntGauge,
+    pub sui_conservation_live_object_size: IntGauge,
+    pub sui_conservation_imbalance: IntGauge,
+    pub sui_conservation_storage_fund: IntGauge,
+    pub sui_conservation_storage_fund_imbalance: IntGauge,
+    pub epoch_flags: IntGaugeVec,
 }
 
 impl AuthorityStoreMetrics {
