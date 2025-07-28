@@ -29,6 +29,7 @@ mod checked {
     };
     use move_vm_types::loaded_data::runtime_types::{CachedDatatype, Type};
     use serde::{de::DeserializeSeed, Deserialize};
+    use std::time::Instant;
     use std::{
         collections::{BTreeMap, BTreeSet},
         fmt,
@@ -62,6 +63,7 @@ mod checked {
         INIT_FN_NAME,
     };
     use tracing::instrument;
+    use tracing::trace;
 
     use crate::adapter::substitute_package_id;
     use crate::programmable_transactions::context::*;
@@ -75,6 +77,7 @@ mod checked {
         gas_charger: &mut GasCharger,
         pt: ProgrammableTransaction,
     ) -> Result<Mode::ExecutionResults, ExecutionError> {
+        let start = Instant::now();
         let ProgrammableTransaction { inputs, commands } = pt;
         let mut context = ExecutionContext::new(
             protocol_config,
@@ -87,6 +90,8 @@ mod checked {
         )?;
         // execute commands
         let mut mode_results = Mode::empty_results();
+        trace!("Till for loop took: {:?}", start.elapsed());
+        let start = Instant::now();
         for (idx, command) in commands.into_iter().enumerate() {
             if let Err(err) = execute_command::<Mode>(&mut context, &mut mode_results, command) {
                 let object_runtime: &ObjectRuntime = context.object_runtime();
@@ -98,6 +103,8 @@ mod checked {
                 return Err(err.with_command_index(idx));
             };
         }
+        trace!("Command execution took: {:?}", start.elapsed());
+        let start = Instant::now();
 
         // Save loaded objects table in case we fail in post execution
         let object_runtime: &ObjectRuntime = context.object_runtime();
@@ -115,6 +122,7 @@ mod checked {
         state_view.save_loaded_runtime_objects(loaded_runtime_objects);
         state_view.save_wrapped_object_containers(wrapped_object_containers);
         state_view.record_execution_results(finished?);
+        trace!("Post execution took: {:?}", start.elapsed());
         Ok(mode_results)
     }
 
