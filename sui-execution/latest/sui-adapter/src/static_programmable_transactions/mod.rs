@@ -8,12 +8,13 @@ use crate::{
 };
 use move_trace_format::format::MoveTraceBuilder;
 use move_vm_runtime::move_vm::MoveVM;
-use std::{cell::RefCell, rc::Rc, sync::Arc};
+use std::{cell::RefCell, rc::Rc, sync::Arc, time::Instant};
 use sui_protocol_config::ProtocolConfig;
 use sui_types::{
     base_types::TxContext, error::ExecutionError, execution::ResultWithTimings,
     metrics::LimitsMetrics, storage::BackingPackageStore, transaction::ProgrammableTransaction,
 };
+use tracing::trace;
 
 // TODO we might replace this with a new one
 pub use crate::data_store::legacy::linkage_view::LinkageView;
@@ -36,6 +37,7 @@ pub fn execute<Mode: ExecutionMode>(
     txn: ProgrammableTransaction,
     trace_builder_opt: &mut Option<MoveTraceBuilder>,
 ) -> ResultWithTimings<Mode::ExecutionResults, ExecutionError> {
+    let start = Instant::now();
     let package_store = CachedPackageStore::new(Box::new(package_store));
     let linkage_analysis = linkage::analysis::linkage_analysis_for_protocol_config::<Mode>(
         protocol_config,
@@ -53,12 +55,19 @@ pub fn execute<Mode: ExecutionMode>(
     );
     let txn = loading::translate::transaction(&env, txn).map_err(|e| (e, vec![]))?;
     let txn = typing::translate_and_verify::<Mode>(&env, txn).map_err(|e| (e, vec![]))?;
-    execution::interpreter::execute::<Mode>(
+    trace!(
+        "Preload for V2 execution completed in {:?}",
+        start.elapsed()
+    );
+    let start = Instant::now();
+    let res = execution::interpreter::execute::<Mode>(
         &mut env,
         metrics,
         tx_context,
         gas_charger,
         txn,
         trace_builder_opt,
-    )
+    );
+    trace!("Interpreter completed in {:?}", start.elapsed());
+    res
 }

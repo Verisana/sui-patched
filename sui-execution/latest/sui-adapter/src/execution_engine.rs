@@ -11,6 +11,7 @@ mod checked {
     use move_binary_format::CompiledModule;
     use move_trace_format::format::MoveTraceBuilder;
     use move_vm_runtime::move_vm::MoveVM;
+    use std::time::Instant;
     use std::{cell::RefCell, collections::HashSet, rc::Rc, sync::Arc};
     use sui_types::accumulator_root::{ACCUMULATOR_ROOT_CREATE_FUNC, ACCUMULATOR_ROOT_MODULE};
     use sui_types::balance::{
@@ -106,6 +107,7 @@ mod checked {
         Vec<ExecutionTiming>,
         Result<Mode::ExecutionResults, ExecutionError>,
     ) {
+        let start = Instant::now();
         let input_objects = input_objects.into_inner();
         let mutable_inputs = if enable_expensive_checks {
             input_objects.mutable_inputs().keys().copied().collect()
@@ -160,6 +162,7 @@ mod checked {
         let is_epoch_change = transaction_kind.is_end_of_epoch_tx();
 
         let deny_cert = is_certificate_denied(&transaction_digest, certificate_deny_set);
+        trace!("Before execute transaction tool: {:?}", start.elapsed());
         let (gas_cost_summary, execution_result, timings) = execute_transaction::<Mode>(
             store,
             &mut temporary_store,
@@ -319,6 +322,7 @@ mod checked {
         Result<Mode::ExecutionResults, ExecutionError>,
         Vec<ExecutionTiming>,
     ) {
+        let start = Instant::now();
         gas_charger.smash_gas(temporary_store);
 
         // At this point no charges have been applied yet
@@ -334,7 +338,8 @@ mod checked {
         // We must charge object read here during transaction execution, because if this fails
         // we must still ensure an effect is committed and all objects versions incremented
         let result = gas_charger.charge_input_objects(temporary_store);
-
+        trace!("Before result and then took: {:?}", start.elapsed());
+        let start = Instant::now();
         let result: ResultWithTimings<Mode::ExecutionResults, ExecutionError> =
             result.map_err(|e| (e, vec![])).and_then(
                 |()| -> ResultWithTimings<Mode::ExecutionResults, ExecutionError> {
@@ -366,7 +371,7 @@ mod checked {
                             _ => panic!("invalid cancellation reason SequenceNumber: {reason}"),
                         }
                     } else {
-                        execution_loop::<Mode>(
+                        let res = execution_loop::<Mode>(
                             store,
                             temporary_store,
                             transaction_kind,
@@ -376,7 +381,9 @@ mod checked {
                             protocol_config,
                             metrics.clone(),
                             trace_builder_opt,
-                        )
+                        );
+                        trace!("Execution loop took: {:?}", start.elapsed());
+                        res
                     };
 
                     let meter_check = check_meter_limit(
@@ -605,6 +612,7 @@ mod checked {
         metrics: Arc<LimitsMetrics>,
         trace_builder_opt: &mut Option<MoveTraceBuilder>,
     ) -> ResultWithTimings<Mode::ExecutionResults, ExecutionError> {
+        let start = Instant::now();
         let result = match transaction_kind {
             TransactionKind::ChangeEpoch(change_epoch) => {
                 let builder = ProgrammableTransactionBuilder::new();
@@ -705,7 +713,7 @@ mod checked {
             }
             TransactionKind::ProgrammableTransaction(pt)
             | TransactionKind::ProgrammableSystemTransaction(pt) => {
-                programmable_transactions::execution::execute::<Mode>(
+                let res = programmable_transactions::execution::execute::<Mode>(
                     protocol_config,
                     metrics,
                     move_vm,
@@ -715,7 +723,12 @@ mod checked {
                     gas_charger,
                     pt,
                     trace_builder_opt,
-                )
+                );
+                trace!(
+                    "Programmable transaction execution took: {:?}",
+                    start.elapsed()
+                );
+                res
             }
             TransactionKind::EndOfEpochTransaction(txns) => {
                 let mut builder = ProgrammableTransactionBuilder::new();

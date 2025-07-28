@@ -78,6 +78,7 @@ mod checked {
         private_generics::{EVENT_MODULE, PRIVATE_TRANSFER_FUNCTIONS, TRANSFER_MODULE},
     };
     use tracing::instrument;
+    use tracing::trace;
 
     pub fn execute<Mode: ExecutionMode>(
         protocol_config: &ProtocolConfig,
@@ -91,6 +92,7 @@ mod checked {
         trace_builder_opt: &mut Option<MoveTraceBuilder>,
     ) -> ResultWithTimings<Mode::ExecutionResults, ExecutionError> {
         if protocol_config.enable_ptb_execution_v2() {
+            trace!("V2 Execution path");
             return static_programmable_transactions::execute::<Mode>(
                 protocol_config,
                 metrics,
@@ -105,6 +107,7 @@ mod checked {
         }
 
         let mut timings = vec![];
+        trace!("Inner Execution path");
         let result = execute_inner::<Mode>(
             &mut timings,
             protocol_config,
@@ -138,6 +141,7 @@ mod checked {
         pt: ProgrammableTransaction,
         trace_builder_opt: &mut Option<MoveTraceBuilder>,
     ) -> Result<Mode::ExecutionResults, ExecutionError> {
+        let start = Instant::now();
         let ProgrammableTransaction { inputs, commands } = pt;
         let mut context = ExecutionContext::new(
             protocol_config,
@@ -153,6 +157,8 @@ mod checked {
 
         // execute commands
         let mut mode_results = Mode::empty_results();
+        trace!("Till for loop took: {:?}", start.elapsed());
+        let start = Instant::now();
         for (idx, command) in commands.into_iter().enumerate() {
             let start = Instant::now();
             if let Err(err) =
@@ -169,6 +175,8 @@ mod checked {
             };
             timings.push(ExecutionTiming::Success(start.elapsed()));
         }
+        trace!("Command execution took: {:?}", start.elapsed());
+        let start = Instant::now();
 
         // Save loaded objects table in case we fail in post execution
         let object_runtime: &ObjectRuntime = context.object_runtime()?;
@@ -186,6 +194,7 @@ mod checked {
         state_view.save_loaded_runtime_objects(loaded_runtime_objects);
         state_view.save_wrapped_object_containers(wrapped_object_containers);
         state_view.record_execution_results(finished?);
+        trace!("Post execution took: {:?}", start.elapsed());
         Ok(mode_results)
     }
 
