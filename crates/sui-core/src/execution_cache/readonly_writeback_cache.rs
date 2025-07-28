@@ -1,4 +1,5 @@
 use super::cache_types::Ticket;
+use super::readonly_execution_cache::ReadonlyCacheInvalidator;
 use super::writeback_cache::{
     CachedCommittedData, LatestObjectCacheEntry, ObjectEntry, UncommittedData,
 };
@@ -66,6 +67,43 @@ pub struct ReadonlyWritebackCache {
 
     store: Arc<ReadonlyAuthorityStore>,
     metrics: Arc<ExecutionCacheMetrics>,
+
+    long_term_cache: MokaCache<ObjectID, LatestObjectCacheEntry>,
+}
+
+impl ReadonlyWritebackCache {
+    fn check_long_term_cache(&self, id: &ObjectID) -> Option<Option<Object>> {
+        match self.long_term_cache.get(id) {
+            Some(latest) => match latest {
+                LatestObjectCacheEntry::Object(_, obj_entry) => match obj_entry {
+                    ObjectEntry::Object(obj) => Some(Some(obj)),
+                    ObjectEntry::Deleted | ObjectEntry::Wrapped => Some(None),
+                },
+                LatestObjectCacheEntry::NonExistent => None,
+            },
+            None => None,
+        }
+    }
+
+    fn cache_long_term_obj(&self, id: &ObjectID, entry: &Option<(ObjectKey, ObjectOrTombstone)>) {
+        let value = match entry {
+            Some((key, obj_or_tombstone)) => match obj_or_tombstone {
+                ObjectOrTombstone::Object(obj) => {
+                    LatestObjectCacheEntry::Object(key.1, ObjectEntry::Object(obj.clone()))
+                }
+                ObjectOrTombstone::Tombstone((_, sequence, digest)) => {
+                    if digest == &ObjectDigest::OBJECT_DIGEST_DELETED {
+                        LatestObjectCacheEntry::Object(*sequence, ObjectEntry::Deleted)
+                    } else {
+                        LatestObjectCacheEntry::Object(*sequence, ObjectEntry::Wrapped)
+                    }
+                }
+            },
+            None => LatestObjectCacheEntry::NonExistent,
+        };
+
+        self.long_term_cache.insert(*id, value);
+    }
 }
 
 impl ReadonlyWritebackCache {
@@ -90,6 +128,11 @@ impl ReadonlyWritebackCache {
             object_notify_read: NotifyRead::new(),
             store,
             metrics,
+            long_term_cache: MokaCache::builder(8)
+                .max_capacity(randomize_cache_capacity_in_tests(
+                    config.object_cache_size(),
+                ))
+                .build(),
         }
     }
 
@@ -315,10 +358,14 @@ impl ReadonlyWritebackCache {
             },
             CacheResult::NegativeHit => None,
             CacheResult::Miss => {
+                if let Some(object) = self.check_long_term_cache(id) {
+                    return object;
+                }
                 let obj = self
                     .store
                     .get_latest_object_or_tombstone(*id)
                     .expect("db error");
+                self.cache_long_term_obj(id, &obj);
                 match obj {
                     Some((key, obj)) => {
                         self.cache_latest_object_by_id(
@@ -878,5 +925,15 @@ impl ObjectCacheRead for ReadonlyWritebackCache {
             })
             .map(|_| ())
             .boxed()
+    }
+}
+
+impl ReadonlyCacheInvalidator for ReadonlyWritebackCache {
+    fn invalidate_objects(&self, _object_ids: &[ObjectID]) -> SuiResult {
+        Ok(())
+    }
+
+    fn invalidate_all_objects(&self) -> SuiResult {
+        Ok(())
     }
 }

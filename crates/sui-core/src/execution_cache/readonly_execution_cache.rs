@@ -14,6 +14,12 @@ use sui_types::storage::{
     PackageObject, ParentSync,
 };
 
+pub trait ReadonlyCacheInvalidator {
+    fn invalidate_objects(&self, object_ids: &[ObjectID]) -> SuiResult;
+
+    fn invalidate_all_objects(&self) -> SuiResult;
+}
+
 // If you have Arc<ExecutionCache>, you cannot return a reference to it as
 // an &Arc<dyn ExecutionCacheRead> (for example), because the trait object is a fat pointer.
 // So, in order to be able to return &Arc<dyn T>, we create all the converted trait objects
@@ -24,18 +30,25 @@ pub struct ReadonlyExecutionCacheTraitPointers {
     pub backing_store: Arc<dyn BackingStore + Send + Sync>,
     pub backing_package_store: Arc<dyn BackingPackageStore + Send + Sync>,
     pub object_store: Arc<dyn ObjectStore + Send + Sync>,
+    pub cache_invalidator: Arc<dyn ReadonlyCacheInvalidator + Send + Sync>,
 }
 
 impl ReadonlyExecutionCacheTraitPointers {
     pub fn new<T>(cache: Arc<T>) -> Self
     where
-        T: ObjectCacheRead + BackingStore + BackingPackageStore + ObjectStore + 'static,
+        T: ObjectCacheRead
+            + BackingStore
+            + BackingPackageStore
+            + ObjectStore
+            + ReadonlyCacheInvalidator
+            + 'static,
     {
         Self {
             object_cache_reader: cache.clone(),
             backing_store: cache.clone(),
             backing_package_store: cache.clone(),
             object_store: cache.clone(),
+            cache_invalidator: cache,
         }
     }
 }
