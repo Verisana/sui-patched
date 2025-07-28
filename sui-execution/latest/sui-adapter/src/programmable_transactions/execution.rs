@@ -152,13 +152,15 @@ mod checked {
             gas_charger,
             inputs,
         )?;
+        trace!("Execution context created in {:?}", start.elapsed());
+        let start = Instant::now();
 
         trace_utils::trace_ptb_summary::<Mode>(&mut context, trace_builder_opt, &commands)?;
+        trace!("PTB summary took: {:?}", start.elapsed());
+        let start = Instant::now();
 
         // execute commands
         let mut mode_results = Mode::empty_results();
-        trace!("Till for loop took: {:?}", start.elapsed());
-        let start = Instant::now();
         for (idx, command) in commands.into_iter().enumerate() {
             let start = Instant::now();
             if let Err(err) =
