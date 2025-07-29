@@ -106,6 +106,7 @@ mod checked {
         Vec<ExecutionTiming>,
         Result<Mode::ExecutionResults, ExecutionError>,
     ) {
+        let mut start = std::time::Instant::now();
         let input_objects = input_objects.into_inner();
         let mutable_inputs = if enable_expensive_checks {
             input_objects.mutable_inputs().keys().copied().collect()
@@ -160,6 +161,11 @@ mod checked {
         let is_epoch_change = transaction_kind.is_end_of_epoch_tx();
 
         let deny_cert = is_certificate_denied(&transaction_digest, certificate_deny_set);
+        trace!(
+            "execute_transaction_to_effects until execute_transaction took {:?}",
+            start.elapsed()
+        );
+        start = std::time::Instant::now();
         let (gas_cost_summary, execution_result, timings) = execute_transaction::<Mode>(
             store,
             &mut temporary_store,
@@ -175,6 +181,8 @@ mod checked {
             cancelled_objects,
             trace_builder_opt,
         );
+        trace!("execute_transaction took {:?}", start.elapsed());
+        start = std::time::Instant::now();
 
         let status = if let Err(error) = &execution_result {
             // Elaborate errors in logs if they are unexpected or their status is terse.
@@ -255,6 +263,7 @@ mod checked {
             *epoch_id,
         );
 
+        trace!("cleanup after execution took {:?}", start.elapsed());
         (
             inner,
             gas_charger.into_gas_status(),
@@ -319,6 +328,7 @@ mod checked {
         Result<Mode::ExecutionResults, ExecutionError>,
         Vec<ExecutionTiming>,
     ) {
+        let mut start = std::time::Instant::now();
         gas_charger.smash_gas(temporary_store);
 
         // At this point no charges have been applied yet
@@ -366,7 +376,9 @@ mod checked {
                             _ => panic!("invalid cancellation reason SequenceNumber: {reason}"),
                         }
                     } else {
-                        execution_loop::<Mode>(
+                        trace!("Until execution loop took {:?}", start.elapsed());
+                        start = std::time::Instant::now();
+                        let res = execution_loop::<Mode>(
                             store,
                             temporary_store,
                             transaction_kind,
@@ -376,7 +388,10 @@ mod checked {
                             protocol_config,
                             metrics.clone(),
                             trace_builder_opt,
-                        )
+                        );
+                        trace!("Execution loop took {:?}", start.elapsed());
+                        start = std::time::Instant::now();
+                        res
                     };
 
                     let meter_check = check_meter_limit(
@@ -435,6 +450,7 @@ mod checked {
             result = Err(e);
         }
 
+        trace!("After execution loop took {:?}", start.elapsed());
         (cost_summary, result, timings)
     }
 
