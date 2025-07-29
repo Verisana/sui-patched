@@ -621,6 +621,7 @@ mod checked {
         metrics: Arc<LimitsMetrics>,
         trace_builder_opt: &mut Option<MoveTraceBuilder>,
     ) -> ResultWithTimings<Mode::ExecutionResults, ExecutionError> {
+        let mut start = std::time::Instant::now();
         let result = match transaction_kind {
             TransactionKind::ChangeEpoch(change_epoch) => {
                 let builder = ProgrammableTransactionBuilder::new();
@@ -721,7 +722,9 @@ mod checked {
             }
             TransactionKind::ProgrammableTransaction(pt)
             | TransactionKind::ProgrammableSystemTransaction(pt) => {
-                programmable_transactions::execution::execute::<Mode>(
+                trace!("Until ptb execution took {:?}", start.elapsed());
+                start = std::time::Instant::now();
+                let res = programmable_transactions::execution::execute::<Mode>(
                     protocol_config,
                     metrics,
                     move_vm,
@@ -731,7 +734,10 @@ mod checked {
                     gas_charger,
                     pt,
                     trace_builder_opt,
-                )
+                );
+                trace!("PTB execution took {:?}", start.elapsed());
+                start = std::time::Instant::now();
+                res
             }
             TransactionKind::EndOfEpochTransaction(txns) => {
                 let mut builder = ProgrammableTransactionBuilder::new();
@@ -834,6 +840,7 @@ mod checked {
         temporary_store
             .check_execution_results_consistency()
             .map_err(|e| (e, vec![]))?;
+        trace!("Execution loop cleanup took {:?}", start.elapsed());
         Ok(result)
     }
 
