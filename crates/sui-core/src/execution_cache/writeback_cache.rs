@@ -102,7 +102,7 @@ pub mod writeback_cache_tests;
 mod notify_read_input_objects_tests;
 
 #[derive(Clone, PartialEq, Eq)]
-enum ObjectEntry {
+pub enum ObjectEntry {
     Object(Object),
     Deleted,
     Wrapped,
@@ -117,7 +117,7 @@ impl ObjectEntry {
         }
     }
 
-    fn is_tombstone(&self) -> bool {
+    pub fn is_tombstone(&self) -> bool {
         match self {
             ObjectEntry::Deleted | ObjectEntry::Wrapped => true,
             ObjectEntry::Object(_) => false,
@@ -161,7 +161,7 @@ impl From<ObjectOrTombstone> for ObjectEntry {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum LatestObjectCacheEntry {
+pub enum LatestObjectCacheEntry {
     Object(SequenceNumber, ObjectEntry),
     NonExistent,
 }
@@ -175,7 +175,7 @@ impl LatestObjectCacheEntry {
         }
     }
 
-    fn is_alive(&self) -> bool {
+    pub fn is_alive(&self) -> bool {
         match self {
             LatestObjectCacheEntry::Object(_, entry) => !entry.is_tombstone(),
             LatestObjectCacheEntry::NonExistent => false,
@@ -199,7 +199,7 @@ type MarkerKey = (EpochId, FullObjectID);
 
 /// UncommittedData stores execution outputs that are not yet written to the db. Entries in this
 /// struct can only be purged after they are committed.
-struct UncommittedData {
+pub struct UncommittedData {
     /// The object dirty set. All writes go into this table first. After we flush the data to the
     /// db, the data is removed from this table and inserted into the object_cache.
     ///
@@ -212,13 +212,13 @@ struct UncommittedData {
     /// reads efficient. `object_cache` cannot contain a more recent version of an object than
     /// `objects`, and neither can have any gaps. Therefore if there is any object <= the version
     /// bound for a child read in objects, it is the correct object to return.
-    objects: DashMap<ObjectID, CachedVersionMap<ObjectEntry>>,
+    pub objects: DashMap<ObjectID, CachedVersionMap<ObjectEntry>>,
 
     // Markers for received objects and deleted shared objects. This contains all of the dirty
     // marker state, which is committed to the db at the same time as other transaction data.
     // After markers are committed to the db we remove them from this table and insert them into
     // marker_cache.
-    markers: DashMap<MarkerKey, CachedVersionMap<MarkerValue>>,
+    pub markers: DashMap<MarkerKey, CachedVersionMap<MarkerValue>>,
 
     transaction_effects: DashMap<TransactionEffectsDigest, TransactionEffects>,
 
@@ -249,7 +249,7 @@ struct UncommittedData {
 }
 
 impl UncommittedData {
-    fn new(config: &ExecutionCacheConfig) -> Self {
+    pub fn new(config: &ExecutionCacheConfig) -> Self {
         Self {
             objects: DashMap::with_shard_amount(2048),
             markers: DashMap::with_shard_amount(2048),
@@ -324,12 +324,12 @@ impl<T: Eq + std::fmt::Debug> IsNewer for PointCacheItem<T> {
 }
 
 /// CachedData stores data that has been committed to the db, but is likely to be read soon.
-struct CachedCommittedData {
+pub struct CachedCommittedData {
     // See module level comment for an explanation of caching strategy.
-    object_cache: MokaCache<ObjectID, Arc<Mutex<CachedVersionMap<ObjectEntry>>>>,
+    pub object_cache: MokaCache<ObjectID, Arc<Mutex<CachedVersionMap<ObjectEntry>>>>,
 
     // See module level comment for an explanation of caching strategy.
-    marker_cache: MokaCache<MarkerKey, Arc<Mutex<CachedVersionMap<MarkerValue>>>>,
+    pub marker_cache: MokaCache<MarkerKey, Arc<Mutex<CachedVersionMap<MarkerValue>>>>,
 
     transactions: MonotonicCache<TransactionDigest, PointCacheItem<Arc<VerifiedTransaction>>>,
 
@@ -347,7 +347,7 @@ struct CachedCommittedData {
 }
 
 impl CachedCommittedData {
-    fn new(config: &ExecutionCacheConfig) -> Self {
+    pub fn new(config: &ExecutionCacheConfig) -> Self {
         let object_cache = MokaCache::builder(8)
             .max_capacity(randomize_cache_capacity_in_tests(
                 config.object_cache_size(),
@@ -455,6 +455,7 @@ pub struct WritebackCache {
     metrics: Arc<ExecutionCacheMetrics>,
 }
 
+#[macro_export]
 macro_rules! check_cache_entry_by_version {
     ($self: ident, $table: expr, $level: expr, $cache: expr, $version: expr) => {
         $self.metrics.record_cache_request($table, $level);
@@ -477,6 +478,7 @@ macro_rules! check_cache_entry_by_version {
     };
 }
 
+#[macro_export]
 macro_rules! check_cache_entry_by_latest {
     ($self: ident, $table: expr, $level: expr, $cache: expr) => {
         $self.metrics.record_cache_request($table, $level);
