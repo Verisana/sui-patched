@@ -151,6 +151,7 @@ mod checked {
         where
             'a: 'state,
         {
+            let mut start = std::time::Instant::now();
             let mut linkage_view = LinkageView::new(Box::new(CachedPackageStore::new(Box::new(
                 state_view.as_sui_resolver(),
             ))));
