@@ -1609,7 +1609,9 @@ mod checked {
             owner: owner.clone(),
             version,
         };
+        tracing::trace!("till value form object took: {:?}", start.elapsed());
         let obj_value = value_from_object(protocol_config, vm, linkage_view, new_packages, obj)?;
+        tracing::trace!("after value form object took: {:?}", start.elapsed());
         let contained_uids = {
             let fully_annotated_layout = vm
                 .get_runtime()
@@ -1622,6 +1624,7 @@ mod checked {
                         protocol_config.resolve_abort_locations_to_package_id(),
                     )
                 })?;
+            tracing::trace!("fully annotate layour took: {:?}", start.elapsed());
             let mut bytes = vec![];
             obj_value.write_bcs_bytes(&mut bytes, None)?;
             match get_all_uids(&fully_annotated_layout, &bytes) {
@@ -1630,6 +1633,7 @@ mod checked {
                 }
                 Ok(uids) => uids,
             }
+            tracing::trace!("get all ids took: {:?}", start.elapsed());
         };
         let runtime_input = object_runtime::InputObject {
             contained_uids,
