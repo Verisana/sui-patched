@@ -154,8 +154,11 @@ mod checked {
             gas_charger,
             inputs,
         )?;
+        tracing::trace!("Execution context created took {:?}", start.elapsed());
+        start = std::time::Instant::now();
 
         trace_utils::trace_ptb_summary::<Mode>(&mut context, trace_builder_opt, &commands)?;
+        tracing::trace!("trace ptb summary took {:?}", start.elapsed());
 
         // execute commands
         let mut mode_results = Mode::empty_results();
