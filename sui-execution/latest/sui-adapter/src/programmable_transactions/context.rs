@@ -156,6 +156,8 @@ mod checked {
                 state_view.as_sui_resolver(),
             ))));
             let mut input_object_map = BTreeMap::new();
+            tracing::trace!("Linkage and input obj took {:?}", start.elapsed());
+            start = std::time::Instant::now();
             let inputs = inputs
                 .into_iter()
                 .map(|call_arg| {
@@ -170,6 +172,8 @@ mod checked {
                     )
                 })
                 .collect::<Result<_, ExecutionError>>()?;
+            tracing::trace!("Loading inputs took {:?}", start.elapsed());
+            start = std::time::Instant::now();
             let gas = if let Some(gas_coin) = gas_charger.gas_coin() {
                 let mut gas = load_object(
                     protocol_config,
@@ -209,6 +213,8 @@ mod checked {
                     },
                 }
             };
+            tracing::trace!("Loading gas coin took {:?}", start.elapsed());
+            start = std::time::Instant::now();
             let native_extensions = new_native_extensions(
                 state_view.as_child_resolver(),
                 input_object_map,
@@ -217,6 +223,7 @@ mod checked {
                 metrics.clone(),
                 tx_context.clone(),
             );
+            tracing::trace!("Creating native extensions took {:?}", start.elapsed());
 
             // Set the profiler if in CLI
             #[skip_checked_arithmetic]
@@ -1569,10 +1576,13 @@ mod checked {
         override_as_immutable: bool,
         id: ObjectID,
     ) -> Result<InputValue, ExecutionError> {
+        let start = std::time::Instant::now();
         let Some(obj) = state_view.read_object(&id) else {
             // protected by transaction input checker
             invariant_violation!("Object {} does not exist yet", id);
         };
+        tracing::trace!("Load object took: {:?}", id, start.elapsed());
+
         // override_as_immutable ==> Owner::Shared or Owner::ConsensusAddressOwner
         assert_invariant!(
             !override_as_immutable
@@ -1629,6 +1639,7 @@ mod checked {
         let prev = input_object_map.insert(id, runtime_input);
         // protected by transaction input checker
         assert_invariant!(prev.is_none(), "Duplicate input object {}", id);
+        tracing::trace!("Load object took: {:?}", start.elapsed());
         Ok(InputValue::new_object(object_metadata, obj_value))
     }
 
