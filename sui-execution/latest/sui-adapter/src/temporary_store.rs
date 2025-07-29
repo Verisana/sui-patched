@@ -388,12 +388,19 @@ impl<'backing> TemporaryStore<'backing> {
     }
 
     pub fn read_object(&self, id: &ObjectID) -> Option<&Object> {
+        let start = std::time::Instant::now();
         // there should be no read after delete
         debug_assert!(!self.execution_results.deleted_object_ids.contains(id));
-        self.execution_results
+        let res = self
+            .execution_results
             .written_objects
             .get(id)
-            .or_else(|| self.input_objects.get(id))
+            .or_else(|| self.input_objects.get(id));
+        tracing::trace!(
+            "Read object from temporary store: {id:?} in {:?}",
+            start.elapsed()
+        );
+        res
     }
 
     pub fn save_loaded_runtime_objects(
