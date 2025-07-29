@@ -1581,7 +1581,7 @@ mod checked {
             // protected by transaction input checker
             invariant_violation!("Object {} does not exist yet", id);
         };
-        tracing::trace!("Load object took: {:?}", id, start.elapsed());
+        tracing::trace!("Load object took: {:?}", start.elapsed());
 
         // override_as_immutable ==> Owner::Shared or Owner::ConsensusAddressOwner
         assert_invariant!(
