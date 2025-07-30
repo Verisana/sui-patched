@@ -42,6 +42,19 @@ impl ReadonlyAuthorityStore {
         Ok(ret)
     }
 
+    /// Return the object with version less then or eq to the provided seq number.
+    /// This is used by indexer to find the correct version of dynamic field child object.
+    /// We do not store the version of the child object, but because of lamport timestamp,
+    /// we know the child must have version number less then or eq to the parent.
+    pub fn find_object_lt_or_eq_version(
+        &self,
+        object_id: ObjectID,
+        version: SequenceNumber,
+    ) -> SuiResult<Option<Object>> {
+        self.perpetual_tables
+            .find_object_lt_or_eq_version(object_id, version)
+    }
+
     /// Returns the latest object we have for this object_id in the objects table.
     ///
     /// If no entry for the object_id is found, return None.

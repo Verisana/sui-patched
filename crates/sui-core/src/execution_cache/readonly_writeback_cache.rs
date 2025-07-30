@@ -32,6 +32,7 @@ use sui_types::storage::{
     FullObjectKey, InputKey, MarkerValue, ObjectKey, ObjectOrTombstone, ObjectStore, PackageObject,
 };
 use sui_types::sui_system_state::SuiSystemState;
+use tap::TapOptional;
 use tracing::{instrument, trace, warn};
 
 pub struct ReadonlyWritebackCache {
@@ -458,10 +459,170 @@ impl ObjectCacheRead for ReadonlyWritebackCache {
     #[instrument(level = "trace", skip_all, fields(object_id, version_bound))]
     fn find_object_lt_or_eq_version(
         &self,
-        _object_id: ObjectID,
-        _version_bound: SequenceNumber,
+        object_id: ObjectID,
+        version_bound: SequenceNumber,
     ) -> Option<Object> {
-        panic!("find_object_lt_or_eq_version should not be called on ReadonlyWritebackCache");
+        macro_rules! check_cache_entry {
+            ($level: expr, $objects: expr) => {
+                self.metrics
+                    .record_cache_request("object_lt_or_eq_version", $level);
+                if let Some(objects) = $objects {
+                    if let Some((_, object)) = objects
+                        .all_versions_lt_or_eq_descending(&version_bound)
+                        .next()
+                    {
+                        if let ObjectEntry::Object(object) = object {
+                            self.metrics
+                                .record_cache_hit("object_lt_or_eq_version", $level);
+                            return Some(object.clone());
+                        } else {
+                            // if we find a tombstone, the object does not exist
+                            self.metrics
+                                .record_cache_negative_hit("object_lt_or_eq_version", $level);
+                            return None;
+                        }
+                    } else {
+                        self.metrics
+                            .record_cache_miss("object_lt_or_eq_version", $level);
+                    }
+                }
+            };
+        }
+
+        // if we have the latest version cached, and it is within the bound, we are done
+        self.metrics
+            .record_cache_request("object_lt_or_eq_version", "object_by_id");
+        let latest_cache_entry = self.object_by_id_cache.get(&object_id);
+        if let Some(latest) = &latest_cache_entry {
+            let latest = latest.lock();
+            match &*latest {
+                LatestObjectCacheEntry::Object(latest_version, object) => {
+                    if *latest_version <= version_bound {
+                        if let ObjectEntry::Object(object) = object {
+                            self.metrics
+                                .record_cache_hit("object_lt_or_eq_version", "object_by_id");
+                            return Some(object.clone());
+                        } else {
+                            // object is a tombstone, but is still within the version bound
+                            self.metrics.record_cache_negative_hit(
+                                "object_lt_or_eq_version",
+                                "object_by_id",
+                            );
+                            return None;
+                        }
+                    }
+                    // latest object is not within the version bound. fall through.
+                }
+                // No object by this ID exists at all
+                LatestObjectCacheEntry::NonExistent => {
+                    self.metrics
+                        .record_cache_negative_hit("object_lt_or_eq_version", "object_by_id");
+                    return None;
+                }
+            }
+        }
+        self.metrics
+            .record_cache_miss("object_lt_or_eq_version", "object_by_id");
+
+        Self::with_locked_cache_entries(
+            &self.dirty.objects,
+            &self.cached.object_cache,
+            &object_id,
+            |dirty_entry, cached_entry| {
+                check_cache_entry!("committed", dirty_entry);
+                check_cache_entry!("uncommitted", cached_entry);
+
+                // Much of the time, the query will be for the very latest object version, so
+                // try that first. But we have to be careful:
+                // 1. We must load the tombstone if it is present, because its version may exceed
+                //    the version_bound, in which case we must do a scan.
+                // 2. You might think we could just call `self.store.get_latest_object_or_tombstone` here.
+                //    But we cannot, because there may be a more recent version in the dirty set, which
+                //    we skipped over in check_cache_entry! because of the version bound. However, if we
+                //    skipped it above, we will skip it here as well, again due to the version bound.
+                // 3. Despite that, we really want to warm the cache here. Why? Because if the object is
+                //    cold (not being written to), then we will very soon be able to start serving reads
+                //    of it from the object_by_id cache, IF we can warm the cache. If we don't warm the
+                //    the cache here, and no writes to the object occur, then we will always have to go
+                //    to the db for the object.
+                //
+                // Lastly, it is important to understand the rationale for all this: If the object is
+                // write-hot, we will serve almost all reads to it from the dirty set (or possibly the
+                // cached set if it is only written to once every few checkpoints). If the object is
+                // write-cold (or non-existent) and read-hot, then we will serve almost all reads to it
+                // from the object_by_id cache check above.  Most of the apparently wasteful code here
+                // exists only to ensure correctness in all the edge cases.
+                let latest: Option<(SequenceNumber, ObjectEntry)> =
+                    if let Some(dirty_set) = dirty_entry {
+                        dirty_set
+                            .get_highest()
+                            .cloned()
+                            .tap_none(|| panic!("dirty set cannot be empty"))
+                    } else {
+                        // TODO: we should try not to read from the db while holding the locks.
+                        self.store
+                            .get_latest_object_or_tombstone(object_id)
+                            .expect("db error")
+                            .map(|(ObjectKey(_, version), obj_or_tombstone)| {
+                                (version, ObjectEntry::from(obj_or_tombstone))
+                            })
+                    };
+
+                if let Some((obj_version, obj_entry)) = latest {
+                    // we can always cache the latest object (or tombstone), even if it is not within the
+                    // version_bound. This is done in order to warm the cache in the case where a sequence
+                    // of transactions all read the same child object without writing to it.
+
+                    // Note: no need to call with_object_by_id_cache_update here, because we are holding
+                    // the lock on the dirty cache entry, and `latest` cannot become out-of-date
+                    // while we hold that lock.
+                    self.cache_latest_object_by_id(
+                        &object_id,
+                        LatestObjectCacheEntry::Object(obj_version, obj_entry.clone()),
+                        // We can get a ticket at the last second, because we are holding the lock
+                        // on dirty, so there cannot be any concurrent writes.
+                        self.object_by_id_cache.get_ticket_for_read(&object_id),
+                    );
+
+                    if obj_version <= version_bound {
+                        match obj_entry {
+                            ObjectEntry::Object(object) => Some(object),
+                            ObjectEntry::Deleted | ObjectEntry::Wrapped => None,
+                        }
+                    } else {
+                        // The latest object exceeded the bound, so now we have to do a scan
+                        // But we already know there is no dirty entry within the bound,
+                        // so we go to the db.
+                        ReadonlyAuthorityStore::find_object_lt_or_eq_version(
+                            &self.store,
+                            object_id,
+                            version_bound,
+                        )
+                        .expect("db error")
+                    }
+
+                // no object found in dirty set or db, object does not exist
+                // When this is called from a read api (i.e. not the execution path) it is
+                // possible that the object has been deleted and pruned. In this case,
+                // there would be no entry at all on disk, but we may have a tombstone in the
+                // cache
+                } else if let Some(latest_cache_entry) = latest_cache_entry {
+                    // If there is a latest cache entry, it had better not be a live object!
+                    assert!(!latest_cache_entry.lock().is_alive());
+                    None
+                } else {
+                    // If there is no latest cache entry, we can insert one.
+                    let highest = cached_entry.and_then(|c| c.get_highest());
+                    assert!(highest.is_none() || highest.unwrap().1.is_tombstone());
+                    self.cache_object_not_found(
+                        &object_id,
+                        // okay to get ticket at last second - see above
+                        self.object_by_id_cache.get_ticket_for_read(&object_id),
+                    );
+                    None
+                }
+            },
+        )
     }
 
     fn get_sui_system_state_object_unsafe(&self) -> SuiResult<SuiSystemState> {
