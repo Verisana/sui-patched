@@ -10,6 +10,7 @@ use super::{
 use crate::authority::authority_per_epoch_store::AuthorityPerEpochStore;
 use crate::authority::authority_store::SuiLockResult;
 use crate::authority::readonly_authority_store::ReadonlyAuthorityStore;
+use crate::fallback_fetch::do_fallback_lookup;
 use crate::{check_cache_entry_by_latest, check_cache_entry_by_version};
 use dashmap::mapref::entry::Entry as DashMapEntry;
 use dashmap::DashMap;
@@ -416,8 +417,19 @@ impl ObjectCacheRead for ReadonlyWritebackCache {
         }
     }
 
-    fn multi_get_objects_by_key(&self, _object_keys: &[ObjectKey]) -> Vec<Option<Object>> {
-        panic!("multi_get_objects_by_key should not be called on ReadonlyWritebackCache");
+    fn multi_get_objects_by_key(&self, object_keys: &[ObjectKey]) -> Vec<Option<Object>> {
+        do_fallback_lookup(
+            object_keys,
+            |key| match self.get_object_by_key_cache_only(&key.0, key.1) {
+                CacheResult::Hit(maybe_object) => CacheResult::Hit(Some(maybe_object)),
+                CacheResult::NegativeHit => CacheResult::NegativeHit,
+                CacheResult::Miss => CacheResult::Miss,
+            },
+            |remaining| {
+                ReadonlyAuthorityStore::multi_get_objects_by_key(&self.store, remaining)
+                    .expect("db error")
+            },
+        )
     }
 
     fn object_exists_by_key(&self, _object_id: &ObjectID, _version: SequenceNumber) -> bool {

@@ -2,6 +2,7 @@ use super::*;
 use authority_store_tables::AuthorityPerpetualTablesReadOnly;
 use std::sync::Arc;
 use sui_types::storage::{ObjectKey, ObjectOrTombstone, ObjectStore};
+use typed_store::Map;
 
 /// ALL_OBJ_VER determines whether we want to store all past
 /// versions of every object in the store. Authority doesn't store
@@ -19,6 +20,26 @@ impl ReadonlyAuthorityStore {
     ) -> SuiResult<Arc<Self>> {
         let store = Arc::new(Self { perpetual_tables });
         Ok(store)
+    }
+
+    pub fn multi_get_objects_by_key(
+        &self,
+        object_keys: &[ObjectKey],
+    ) -> Result<Vec<Option<Object>>, SuiError> {
+        let wrappers = self
+            .perpetual_tables
+            .objects
+            .multi_get(object_keys.to_vec())?;
+        let mut ret = vec![];
+
+        for (idx, w) in wrappers.into_iter().enumerate() {
+            ret.push(
+                w.map(|object| self.perpetual_tables.object(&object_keys[idx], object))
+                    .transpose()?
+                    .flatten(),
+            );
+        }
+        Ok(ret)
     }
 
     /// Returns the latest object we have for this object_id in the objects table.
