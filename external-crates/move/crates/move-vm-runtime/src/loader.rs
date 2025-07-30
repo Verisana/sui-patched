@@ -1443,6 +1443,10 @@ impl Loader {
             module_loader.pop();
             tracing::trace!("inside loop after pop took {:?}", start.elapsed());
         }
+        tracing::trace!(
+            "verify module and dependencies after loop took {:?}",
+            start.elapsed()
+        );
 
         Ok((storage_id, module))
     }
