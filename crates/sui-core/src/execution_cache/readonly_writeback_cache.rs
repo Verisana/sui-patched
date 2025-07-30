@@ -4,6 +4,7 @@ use super::ObjectCacheRead;
 use crate::authority::authority_per_epoch_store::AuthorityPerEpochStore;
 use crate::authority::authority_store::SuiLockResult;
 use crate::authority::readonly_authority_store::ReadonlyAuthorityStore;
+use dashmap::DashMap;
 use futures::future::BoxFuture;
 use moka::sync::SegmentedCache as MokaCache;
 use mysten_common::random_util::randomize_cache_capacity_in_tests;
@@ -23,18 +24,18 @@ use sui_types::sui_system_state::SuiSystemState;
 use tracing::{instrument, warn};
 
 pub struct ReadonlyWritebackCache {
-    packages: MokaCache<ObjectID, Option<PackageObject>>,
-
     store: Arc<ReadonlyAuthorityStore>,
 
-    long_term_cache: MokaCache<ObjectID, LatestObjectCacheEntry>,
-    long_term_obj_lt_eq_version: MokaCache<(ObjectID, SequenceNumber), Option<Object>>,
-    long_term_obj_by_key: MokaCache<(ObjectID, SequenceNumber), Option<Object>>,
+    packages: MokaCache<ObjectID, Option<PackageObject>>,
+
+    obj_cache: MokaCache<ObjectID, LatestObjectCacheEntry>,
+    obj_lt_eq_version: MokaCache<ObjectID, DashMap<SequenceNumber, Option<Object>>>,
+    obj_by_key: MokaCache<ObjectID, DashMap<SequenceNumber, Option<Object>>>,
 }
 
 impl ReadonlyWritebackCache {
     fn check_long_term_cache(&self, id: &ObjectID) -> Option<Option<Object>> {
-        match self.long_term_cache.get(id) {
+        match self.obj_cache.get(id) {
             Some(latest) => match latest {
                 LatestObjectCacheEntry::Object(_, obj_entry) => match obj_entry {
                     ObjectEntry::Object(obj) => Some(Some(obj)),
@@ -63,7 +64,7 @@ impl ReadonlyWritebackCache {
             None => LatestObjectCacheEntry::NonExistent,
         };
 
-        self.long_term_cache.insert(*id, value);
+        self.obj_cache.insert(*id, value);
     }
 
     fn check_long_term_lt_eq_version_cache(
@@ -71,7 +72,10 @@ impl ReadonlyWritebackCache {
         id: &ObjectID,
         version: SequenceNumber,
     ) -> Option<Option<Object>> {
-        self.long_term_obj_lt_eq_version.get(&(*id, version))
+        self.obj_lt_eq_version
+            .get(id)?
+            .get(&version)
+            .map(|entry| entry.clone())
     }
 
     fn cache_long_term_lt_eq_version(
@@ -80,8 +84,15 @@ impl ReadonlyWritebackCache {
         version: SequenceNumber,
         entry: &Option<Object>,
     ) {
-        self.long_term_obj_lt_eq_version
-            .insert((*id, version), entry.clone());
+        match self.obj_lt_eq_version.get(id) {
+            Some(entries) => {
+                entries.insert(version, entry.clone());
+            }
+            None => {
+                self.obj_lt_eq_version
+                    .insert(*id, DashMap::from_iter([(version, entry.clone())]));
+            }
+        }
     }
 
     fn check_package_cache(&self, id: &ObjectID) -> Option<Option<PackageObject>> {
@@ -97,7 +108,10 @@ impl ReadonlyWritebackCache {
         id: &ObjectID,
         version: SequenceNumber,
     ) -> Option<Option<Object>> {
-        self.long_term_obj_by_key.get(&(*id, version))
+        self.obj_by_key
+            .get(id)?
+            .get(&version)
+            .map(|entry| entry.clone())
     }
 
     fn cache_long_term_object_by_key(
@@ -106,8 +120,15 @@ impl ReadonlyWritebackCache {
         version: SequenceNumber,
         entry: &Option<Object>,
     ) {
-        self.long_term_obj_by_key
-            .insert((*id, version), entry.clone());
+        match self.obj_by_key.get(id) {
+            Some(entries) => {
+                entries.insert(version, entry.clone());
+            }
+            None => {
+                self.obj_by_key
+                    .insert(*id, DashMap::from_iter([(version, entry.clone())]));
+            }
+        }
     }
 
     fn get_object_by_key_impl(
@@ -135,17 +156,17 @@ impl ReadonlyWritebackCache {
         Self {
             packages,
             store,
-            long_term_cache: MokaCache::builder(8)
+            obj_cache: MokaCache::builder(8)
                 .max_capacity(randomize_cache_capacity_in_tests(
                     config.object_cache_size(),
                 ))
                 .build(),
-            long_term_obj_lt_eq_version: MokaCache::builder(8)
+            obj_lt_eq_version: MokaCache::builder(8)
                 .max_capacity(randomize_cache_capacity_in_tests(
                     config.object_cache_size(),
                 ))
                 .build(),
-            long_term_obj_by_key: MokaCache::builder(8)
+            obj_by_key: MokaCache::builder(8)
                 .max_capacity(randomize_cache_capacity_in_tests(
                     config.object_cache_size(),
                 ))
@@ -315,11 +336,19 @@ impl ObjectCacheRead for ReadonlyWritebackCache {
 }
 
 impl ReadonlyCacheInvalidator for ReadonlyWritebackCache {
-    fn invalidate_objects(&self, _object_ids: &[ObjectID]) -> SuiResult {
+    fn invalidate_objects(&self, object_ids: &[ObjectID]) -> SuiResult {
+        object_ids.iter().for_each(|id| {
+            self.obj_cache.invalidate(id);
+            self.obj_lt_eq_version.invalidate(id);
+            self.obj_by_key.invalidate(id);
+        });
         Ok(())
     }
 
     fn invalidate_all_objects(&self) -> SuiResult {
+        self.obj_by_key.invalidate_all();
+        self.obj_lt_eq_version.invalidate_all();
+        self.obj_cache.invalidate_all();
         Ok(())
     }
 }
