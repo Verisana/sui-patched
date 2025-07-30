@@ -151,13 +151,10 @@ mod checked {
         where
             'a: 'state,
         {
-            let mut start = std::time::Instant::now();
             let mut linkage_view = LinkageView::new(Box::new(CachedPackageStore::new(Box::new(
                 state_view.as_sui_resolver(),
             ))));
             let mut input_object_map = BTreeMap::new();
-            tracing::trace!("Linkage and input obj took {:?}", start.elapsed());
-            start = std::time::Instant::now();
             let inputs = inputs
                 .into_iter()
                 .map(|call_arg| {
@@ -172,8 +169,6 @@ mod checked {
                     )
                 })
                 .collect::<Result<_, ExecutionError>>()?;
-            tracing::trace!("Loading inputs took {:?}", start.elapsed());
-            start = std::time::Instant::now();
             let gas = if let Some(gas_coin) = gas_charger.gas_coin() {
                 let mut gas = load_object(
                     protocol_config,
@@ -213,8 +208,6 @@ mod checked {
                     },
                 }
             };
-            tracing::trace!("Loading gas coin took {:?}", start.elapsed());
-            start = std::time::Instant::now();
             let native_extensions = new_native_extensions(
                 state_view.as_child_resolver(),
                 input_object_map,
@@ -223,7 +216,6 @@ mod checked {
                 metrics.clone(),
                 tx_context.clone(),
             );
-            tracing::trace!("Creating native extensions took {:?}", start.elapsed());
 
             // Set the profiler if in CLI
             #[skip_checked_arithmetic]
@@ -1396,7 +1388,6 @@ mod checked {
         new_packages: &[MovePackage],
         struct_tag: &StructTag,
     ) -> VMResult<Type> {
-        let mut start = std::time::Instant::now();
         fn verification_error<T>(code: StatusCode) -> VMResult<T> {
             Err(PartialVMError::new(code).finish(Location::Undefined))
         }
@@ -1411,20 +1402,8 @@ mod checked {
         // Load the package that the struct is defined in, in storage
         let defining_id = ObjectID::from_address(*address);
 
-        tracing::trace!(
-            "Loading type from struct with defining took {:?}",
-            start.elapsed()
-        );
         let data_store = SuiDataStore::new(linkage_view, new_packages);
-        tracing::trace!(
-            "Loading type from struct with data store took {:?}",
-            start.elapsed()
-        );
         let move_package = get_package(&data_store, defining_id)?;
-        tracing::trace!(
-            "Loading type from struct with move package took {:?}",
-            start.elapsed()
-        );
 
         // Set the defining package as the link context while loading the
         // struct
@@ -1436,15 +1415,7 @@ mod checked {
 
         let runtime_id = ModuleId::new(original_address, module.clone());
         let data_store = SuiDataStore::new(linkage_view, new_packages);
-        tracing::trace!(
-            "Loading type from struct second data store took {:?}",
-            start.elapsed()
-        );
         let res = vm.get_runtime().load_type(&runtime_id, name, &data_store);
-        tracing::trace!(
-            "Loading type from struct with load type took {:?}",
-            start.elapsed()
-        );
         linkage_view.reset_linkage().map_err(|e| {
             PartialVMError::new(StatusCode::UNKNOWN_INVARIANT_VIOLATION_ERROR)
                 .with_message(e.to_string())
@@ -1458,7 +1429,7 @@ mod checked {
             return verification_error(StatusCode::NUMBER_OF_TYPE_ARGUMENTS_MISMATCH);
         }
 
-        let res = if type_params.is_empty() {
+        if type_params.is_empty() {
             Ok(Type::Datatype(idx))
         } else {
             let loaded_type_params = type_params
@@ -1478,12 +1449,7 @@ mod checked {
                 idx,
                 loaded_type_params,
             ))))
-        };
-        tracing::trace!(
-            "Loading type from struct with final type took {:?}",
-            start.elapsed()
-        );
-        res
+        }
     }
 
     /// Load `type_tag` to get a `Type` in the provided `session`.  `session`'s linkage context may be
@@ -1524,7 +1490,6 @@ mod checked {
         used_in_non_entry_move_call: bool,
         contents: &[u8],
     ) -> Result<ObjectValue, ExecutionError> {
-        let mut start = std::time::Instant::now();
         let contents = if type_.is_coin() {
             let Ok(coin) = Coin::from_bcs_bytes(contents) else {
                 invariant_violation!("Could not deserialize a coin")
@@ -1533,7 +1498,6 @@ mod checked {
         } else {
             ObjectContents::Raw(contents.to_vec())
         };
-        tracing::trace!("make object value contents took: {:?}", start.elapsed());
 
         let tag: StructTag = type_.into();
         let type_ = load_type_from_struct(vm, linkage_view, new_packages, &tag).map_err(|e| {
@@ -1544,7 +1508,6 @@ mod checked {
                 protocol_config.resolve_abort_locations_to_package_id(),
             )
         })?;
-        tracing::trace!("make object value type took: {:?}", start.elapsed());
         let has_public_transfer = if protocol_config.recompute_has_public_transfer_in_execution() {
             let abilities = vm.get_runtime().get_type_abilities(&type_).map_err(|e| {
                 convert_vm_error(
@@ -1558,10 +1521,6 @@ mod checked {
         } else {
             has_public_transfer
         };
-        tracing::trace!(
-            "make object value has public transfer took: {:?}",
-            start.elapsed()
-        );
         Ok(ObjectValue {
             type_,
             has_public_transfer,
@@ -1609,13 +1568,10 @@ mod checked {
         override_as_immutable: bool,
         id: ObjectID,
     ) -> Result<InputValue, ExecutionError> {
-        let start = std::time::Instant::now();
         let Some(obj) = state_view.read_object(&id) else {
             // protected by transaction input checker
             invariant_violation!("Object {} does not exist yet", id);
         };
-        tracing::trace!("Load object {} took: {:?}", id, start.elapsed());
-
         // override_as_immutable ==> Owner::Shared or Owner::ConsensusAddressOwner
         assert_invariant!(
             !override_as_immutable
@@ -1642,9 +1598,7 @@ mod checked {
             owner: owner.clone(),
             version,
         };
-        tracing::trace!("till value form object took: {:?}", start.elapsed());
         let obj_value = value_from_object(protocol_config, vm, linkage_view, new_packages, obj)?;
-        tracing::trace!("after value form object took: {:?}", start.elapsed());
         let contained_uids = {
             let fully_annotated_layout = vm
                 .get_runtime()
@@ -1657,17 +1611,14 @@ mod checked {
                         protocol_config.resolve_abort_locations_to_package_id(),
                     )
                 })?;
-            tracing::trace!("fully annotate layour took: {:?}", start.elapsed());
             let mut bytes = vec![];
             obj_value.write_bcs_bytes(&mut bytes, None)?;
-            let res = match get_all_uids(&fully_annotated_layout, &bytes) {
+            match get_all_uids(&fully_annotated_layout, &bytes) {
                 Err(e) => {
                     invariant_violation!("Unable to retrieve UIDs for object. Got error: {e}")
                 }
                 Ok(uids) => uids,
-            };
-            tracing::trace!("get all ids took: {:?}", start.elapsed());
-            res
+            }
         };
         let runtime_input = object_runtime::InputObject {
             contained_uids,
@@ -1677,7 +1628,6 @@ mod checked {
         let prev = input_object_map.insert(id, runtime_input);
         // protected by transaction input checker
         assert_invariant!(prev.is_none(), "Duplicate input object {}", id);
-        tracing::trace!("Load object took: {:?}", start.elapsed());
         Ok(InputValue::new_object(object_metadata, obj_value))
     }
 
