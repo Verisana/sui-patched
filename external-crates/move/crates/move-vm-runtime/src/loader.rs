@@ -1363,6 +1363,7 @@ impl Loader {
         visiting: &mut BTreeSet<ModuleId>,
         allow_module_loading_failure: bool,
     ) -> VMResult<(ModuleId, Arc<CompiledModule>)> {
+        let mut start = std::time::Instant::now();
         // make a stack for dependencies traversal (DAG traversal)
         let mut module_loader = ModuleLoader::new(visiting);
         // load and verify the module, and push it on the stack for dependencies traversal
@@ -1372,6 +1373,11 @@ impl Loader {
             data_store,
             allow_module_loading_failure,
         )?;
+        tracing::trace!(
+            "verify module and dependencies verify and push took {:?}",
+            start.elapsed()
+        );
+        start = std::time::Instant::now();
 
         loop {
             // get the entry at the top of the stack
@@ -1409,6 +1415,11 @@ impl Loader {
                     // loop with dep at the top of the stack
                     continue;
                 }
+                tracing::trace!(
+                    "inside loop after verify and push took {:?}",
+                    start.elapsed()
+                );
+                start = std::time::Instant::now();
                 // no more deps, check linkage
                 module_loader.verify_linkage()?;
                 // add to the list of verified modules
@@ -1419,6 +1430,7 @@ impl Loader {
             }
             // finished with top element, pop
             module_loader.pop();
+            tracing::trace!("inside loop after pop took {:?}", start.elapsed());
         }
 
         Ok((storage_id, module))
