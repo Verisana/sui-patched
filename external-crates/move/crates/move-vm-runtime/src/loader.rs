@@ -1064,12 +1064,21 @@ impl Loader {
         runtime_id: &ModuleId,
         data_store: &impl DataStore,
     ) -> VMResult<(CachedTypeIndex, Arc<CachedDatatype>)> {
+        let mut start = std::time::Instant::now();
         self.load_module(runtime_id, data_store)?;
-        self.module_cache
+        tracing::trace!("Loader::load_type_by_name took {:?}", start.elapsed());
+        start = std::time::Instant::now();
+        let res = self
+            .module_cache
             .read()
             // Should work if the type exists, because module was loaded above.
             .resolve_type_by_name(name, runtime_id)
-            .map_err(|e| e.finish(Location::Undefined))
+            .map_err(|e| e.finish(Location::Undefined));
+        tracing::trace!(
+            "Loader::load_type_by_name resolve took {:?}",
+            start.elapsed()
+        );
+        res
     }
 
     /// Try to load a type tag from the cache. The `type_tag` must be a defining ID-based type tag.
