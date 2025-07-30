@@ -1192,13 +1192,23 @@ impl Loader {
         bundle_verified: &BTreeMap<ModuleId, &CompiledModule>,
         data_store: &impl DataStore,
     ) -> VMResult<(Arc<CompiledModule>, Arc<LoadedModule>)> {
+        let mut start = std::time::Instant::now();
         let link_context = data_store
             .link_context()
             .map_err(|e| e.finish(Location::Undefined))?;
-
+        tracing::trace!(
+            "load module internal link context took {:?}",
+            start.elapsed()
+        );
+        start = std::time::Instant::now();
         {
             let locked_cache = self.module_cache.read();
             if let Some(loaded) = locked_cache.loaded_module_at(link_context, runtime_id) {
+                tracing::trace!(
+                    "load module internal loaded module took {:?}",
+                    start.elapsed()
+                );
+                start = std::time::Instant::now();
                 let Some(compiled) = locked_cache.compiled_module_at(&loaded.id) else {
                     unreachable!(
                         "Loaded module without verified compiled module.\n\
@@ -1207,6 +1217,11 @@ impl Loader {
                          Loaded module: {loaded:#?}"
                     );
                 };
+                tracing::trace!(
+                    "load module internal compiled module took {:?}",
+                    start.elapsed()
+                );
+                start = std::time::Instant::now();
 
                 return Ok((compiled, loaded));
             }
@@ -1222,10 +1237,20 @@ impl Loader {
             &mut visiting,
             allow_module_loading_failure,
         )?;
+        tracing::trace!(
+            "load module internal verify module and dependencies took {:?}",
+            start.elapsed()
+        );
+        start = std::time::Instant::now();
 
         // verify that the transitive closure does not have cycles
         self.verify_module_cyclic_relations(compiled.as_ref(), bundle_verified, data_store)
             .map_err(expect_no_verification_errors)?;
+        tracing::trace!(
+            "load module internal verify cyclic relations took {:?}",
+            start.elapsed()
+        );
+        start = std::time::Instant::now();
 
         // load the compiled module
         let loaded = self.module_cache.write().insert(
@@ -1234,6 +1259,10 @@ impl Loader {
             storage_id,
             compiled.as_ref(),
         )?;
+        tracing::trace!(
+            "load module internal insert module into cache took {:?}",
+            start.elapsed()
+        );
 
         Ok((compiled, loaded))
     }
