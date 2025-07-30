@@ -1498,6 +1498,7 @@ mod checked {
         used_in_non_entry_move_call: bool,
         contents: &[u8],
     ) -> Result<ObjectValue, ExecutionError> {
+        let mut start = std::time::Instant::now();
         let contents = if type_.is_coin() {
             let Ok(coin) = Coin::from_bcs_bytes(contents) else {
                 invariant_violation!("Could not deserialize a coin")
@@ -1506,6 +1507,7 @@ mod checked {
         } else {
             ObjectContents::Raw(contents.to_vec())
         };
+        tracing::trace!("make object value contents took: {:?}", start.elapsed());
 
         let tag: StructTag = type_.into();
         let type_ = load_type_from_struct(vm, linkage_view, new_packages, &tag).map_err(|e| {
@@ -1516,6 +1518,7 @@ mod checked {
                 protocol_config.resolve_abort_locations_to_package_id(),
             )
         })?;
+        tracing::trace!("make object value type took: {:?}", start.elapsed());
         let has_public_transfer = if protocol_config.recompute_has_public_transfer_in_execution() {
             let abilities = vm.get_runtime().get_type_abilities(&type_).map_err(|e| {
                 convert_vm_error(
@@ -1529,6 +1532,10 @@ mod checked {
         } else {
             has_public_transfer
         };
+        tracing::trace!(
+            "make object value has public transfer took: {:?}",
+            start.elapsed()
+        );
         Ok(ObjectValue {
             type_,
             has_public_transfer,
