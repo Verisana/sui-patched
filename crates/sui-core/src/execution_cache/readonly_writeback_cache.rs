@@ -1,17 +1,14 @@
 use super::cache_types::Ticket;
+use super::cache_types::{CacheResult, CachedVersionMap, MonotonicCache};
 use super::readonly_execution_cache::ReadonlyCacheInvalidator;
 use super::writeback_cache::{
     CachedCommittedData, LatestObjectCacheEntry, ObjectEntry, UncommittedData,
 };
-use super::{
-    cache_types::{CacheResult, CachedVersionMap, MonotonicCache},
-    ExecutionCacheMetrics, ObjectCacheRead,
-};
+use super::ObjectCacheRead;
 use crate::authority::authority_per_epoch_store::AuthorityPerEpochStore;
 use crate::authority::authority_store::SuiLockResult;
 use crate::authority::readonly_authority_store::ReadonlyAuthorityStore;
 use crate::fallback_fetch::do_fallback_lookup;
-use crate::{check_cache_entry_by_latest, check_cache_entry_by_version};
 use dashmap::mapref::entry::Entry as DashMapEntry;
 use dashmap::DashMap;
 use futures::future::BoxFuture;
@@ -34,6 +31,36 @@ use sui_types::storage::{
 use sui_types::sui_system_state::SuiSystemState;
 use tap::TapOptional;
 use tracing::{instrument, trace, warn};
+
+macro_rules! check_cache_entry_by_version {
+    ($self: ident, $table: expr, $level: expr, $cache: expr, $version: expr) => {
+        if let Some(cache) = $cache {
+            if let Some(entry) = cache.get(&$version) {
+                return CacheResult::Hit(entry.clone());
+            }
+
+            if let Some(least_version) = cache.get_least() {
+                if least_version.0 < $version {
+                    // If the version is greater than the least version in the cache, then we know
+                    // that the object does not exist anywhere
+                    return CacheResult::NegativeHit;
+                }
+            }
+        }
+    };
+}
+
+macro_rules! check_cache_entry_by_latest {
+    ($self: ident, $table: expr, $level: expr, $cache: expr) => {
+        if let Some(cache) = $cache {
+            if let Some((version, entry)) = cache.get_highest() {
+                return CacheResult::Hit((*version, entry.clone()));
+            } else {
+                panic!("empty CachedVersionMap should have been removed");
+            }
+        }
+    };
+}
 
 pub struct ReadonlyWritebackCache {
     dirty: UncommittedData,
@@ -60,7 +87,6 @@ pub struct ReadonlyWritebackCache {
     packages: MokaCache<ObjectID, PackageObject>,
 
     store: Arc<ReadonlyAuthorityStore>,
-    metrics: Arc<ExecutionCacheMetrics>,
 
     long_term_cache: MokaCache<ObjectID, LatestObjectCacheEntry>,
 }
@@ -101,11 +127,7 @@ impl ReadonlyWritebackCache {
 }
 
 impl ReadonlyWritebackCache {
-    pub fn new(
-        config: &ExecutionCacheConfig,
-        store: Arc<ReadonlyAuthorityStore>,
-        metrics: Arc<ExecutionCacheMetrics>,
-    ) -> Self {
+    pub fn new(config: &ExecutionCacheConfig, store: Arc<ReadonlyAuthorityStore>) -> Self {
         let packages = MokaCache::builder(8)
             .max_capacity(randomize_cache_capacity_in_tests(
                 config.package_cache_size(),
@@ -119,7 +141,6 @@ impl ReadonlyWritebackCache {
             )),
             packages,
             store,
-            metrics,
             long_term_cache: MokaCache::builder(8)
                 .max_capacity(randomize_cache_capacity_in_tests(
                     config.object_cache_size(),
@@ -202,11 +223,9 @@ impl ReadonlyWritebackCache {
 
     fn get_object_entry_by_id_cache_only(
         &self,
-        request_type: &'static str,
+        _request_type: &'static str,
         object_id: &ObjectID,
     ) -> CacheResult<(SequenceNumber, ObjectEntry)> {
-        self.metrics
-            .record_cache_request(request_type, "object_by_id");
         let entry = self.object_by_id_cache.get(object_id);
 
         if cfg!(debug_assertions) {
@@ -255,17 +274,12 @@ impl ReadonlyWritebackCache {
             let entry = entry.lock();
             match &*entry {
                 LatestObjectCacheEntry::Object(latest_version, latest_object) => {
-                    self.metrics.record_cache_hit(request_type, "object_by_id");
                     return CacheResult::Hit((*latest_version, latest_object.clone()));
                 }
                 LatestObjectCacheEntry::NonExistent => {
-                    self.metrics
-                        .record_cache_negative_hit(request_type, "object_by_id");
                     return CacheResult::NegativeHit;
                 }
             }
-        } else {
-            self.metrics.record_cache_miss(request_type, "object_by_id");
         }
 
         Self::with_locked_cache_entries(
@@ -331,10 +345,8 @@ impl ReadonlyWritebackCache {
             .insert(object_id, object, ticket)
             .is_ok()
         {
-            self.metrics.record_cache_write("object_by_id");
         } else {
             trace!("discarded cache write due to expired ticket");
-            self.metrics.record_ticket_expiry();
         }
     }
 
@@ -345,8 +357,6 @@ impl ReadonlyWritebackCache {
 
 impl ObjectCacheRead for ReadonlyWritebackCache {
     fn get_package_object(&self, package_id: &ObjectID) -> SuiResult<Option<PackageObject>> {
-        self.metrics
-            .record_cache_request("package", "package_cache");
         if let Some(p) = self.packages.get(package_id) {
             if cfg!(debug_assertions) {
                 let canonical_package = self
@@ -368,10 +378,7 @@ impl ObjectCacheRead for ReadonlyWritebackCache {
                     );
                 }
             }
-            self.metrics.record_cache_hit("package", "package_cache");
             return Ok(Some(p));
-        } else {
-            self.metrics.record_cache_miss("package", "package_cache");
         }
 
         // We try the dirty objects cache as well before going to the database. This is necessary
@@ -384,7 +391,6 @@ impl ObjectCacheRead for ReadonlyWritebackCache {
                     "caching package: {:?}",
                     p.object().compute_object_reference()
                 );
-                self.metrics.record_cache_write("package");
                 self.packages.insert(*package_id, p.clone());
                 Ok(Some(p))
             } else {
@@ -464,34 +470,23 @@ impl ObjectCacheRead for ReadonlyWritebackCache {
     ) -> Option<Object> {
         macro_rules! check_cache_entry {
             ($level: expr, $objects: expr) => {
-                self.metrics
-                    .record_cache_request("object_lt_or_eq_version", $level);
                 if let Some(objects) = $objects {
                     if let Some((_, object)) = objects
                         .all_versions_lt_or_eq_descending(&version_bound)
                         .next()
                     {
                         if let ObjectEntry::Object(object) = object {
-                            self.metrics
-                                .record_cache_hit("object_lt_or_eq_version", $level);
                             return Some(object.clone());
                         } else {
                             // if we find a tombstone, the object does not exist
-                            self.metrics
-                                .record_cache_negative_hit("object_lt_or_eq_version", $level);
                             return None;
                         }
-                    } else {
-                        self.metrics
-                            .record_cache_miss("object_lt_or_eq_version", $level);
                     }
                 }
             };
         }
 
         // if we have the latest version cached, and it is within the bound, we are done
-        self.metrics
-            .record_cache_request("object_lt_or_eq_version", "object_by_id");
         let latest_cache_entry = self.object_by_id_cache.get(&object_id);
         if let Some(latest) = &latest_cache_entry {
             let latest = latest.lock();
@@ -499,15 +494,9 @@ impl ObjectCacheRead for ReadonlyWritebackCache {
                 LatestObjectCacheEntry::Object(latest_version, object) => {
                     if *latest_version <= version_bound {
                         if let ObjectEntry::Object(object) = object {
-                            self.metrics
-                                .record_cache_hit("object_lt_or_eq_version", "object_by_id");
                             return Some(object.clone());
                         } else {
                             // object is a tombstone, but is still within the version bound
-                            self.metrics.record_cache_negative_hit(
-                                "object_lt_or_eq_version",
-                                "object_by_id",
-                            );
                             return None;
                         }
                     }
@@ -515,14 +504,10 @@ impl ObjectCacheRead for ReadonlyWritebackCache {
                 }
                 // No object by this ID exists at all
                 LatestObjectCacheEntry::NonExistent => {
-                    self.metrics
-                        .record_cache_negative_hit("object_lt_or_eq_version", "object_by_id");
                     return None;
                 }
             }
         }
-        self.metrics
-            .record_cache_miss("object_lt_or_eq_version", "object_by_id");
 
         Self::with_locked_cache_entries(
             &self.dirty.objects,

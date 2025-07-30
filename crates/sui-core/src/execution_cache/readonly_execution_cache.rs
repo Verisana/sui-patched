@@ -1,8 +1,7 @@
 use super::readonly_writeback_cache::ReadonlyWritebackCache;
-use super::{ExecutionCacheMetrics, ObjectCacheRead};
+use super::ObjectCacheRead;
 use crate::authority::readonly_authority_store::ReadonlyAuthorityStore;
 use crate::implement_storage_traits;
-use prometheus::Registry;
 use std::sync::Arc;
 use sui_config::ExecutionCacheConfig;
 use sui_types::base_types::{FullObjectID, ObjectID, ObjectRef, SequenceNumber};
@@ -55,13 +54,10 @@ impl ReadonlyExecutionCacheTraitPointers {
 
 pub fn build_readonly_execution_cache(
     cache_config: &ExecutionCacheConfig,
-    prometheus_registry: &Registry,
     store: &Arc<ReadonlyAuthorityStore>,
 ) -> ReadonlyExecutionCacheTraitPointers {
-    let execution_cache_metrics = Arc::new(ExecutionCacheMetrics::new(prometheus_registry));
-
     ReadonlyExecutionCacheTraitPointers::new(
-        ReadonlyWritebackCache::new(cache_config, store.clone(), execution_cache_metrics).into(),
+        ReadonlyWritebackCache::new(cache_config, store.clone()).into(),
     )
 }
 
