@@ -90,9 +90,7 @@ mod checked {
         pt: ProgrammableTransaction,
         trace_builder_opt: &mut Option<MoveTraceBuilder>,
     ) -> ResultWithTimings<Mode::ExecutionResults, ExecutionError> {
-        let mut start = std::time::Instant::now();
         if protocol_config.enable_ptb_execution_v2() {
-            tracing::trace!("Executing programmable transaction with PTB v2");
             return static_programmable_transactions::execute::<Mode>(
                 protocol_config,
                 metrics,
@@ -106,8 +104,6 @@ mod checked {
             );
         }
 
-        tracing::trace!("Took inner path took {:?}", start.elapsed());
-        start = std::time::Instant::now();
         let mut timings = vec![];
         let result = execute_inner::<Mode>(
             &mut timings,
@@ -120,7 +116,6 @@ mod checked {
             pt,
             trace_builder_opt,
         );
-        tracing::trace!("Execute inner took {:?}", start.elapsed());
 
         match result {
             Ok(result) => Ok((result, timings)),
@@ -143,7 +138,6 @@ mod checked {
         pt: ProgrammableTransaction,
         trace_builder_opt: &mut Option<MoveTraceBuilder>,
     ) -> Result<Mode::ExecutionResults, ExecutionError> {
-        let mut start = std::time::Instant::now();
         let ProgrammableTransaction { inputs, commands } = pt;
         let mut context = ExecutionContext::new(
             protocol_config,
@@ -154,16 +148,11 @@ mod checked {
             gas_charger,
             inputs,
         )?;
-        tracing::trace!("Execution context created took {:?}", start.elapsed());
-        start = std::time::Instant::now();
 
         trace_utils::trace_ptb_summary::<Mode>(&mut context, trace_builder_opt, &commands)?;
-        tracing::trace!("trace ptb summary took {:?}", start.elapsed());
 
         // execute commands
         let mut mode_results = Mode::empty_results();
-        tracing::trace!("Before for loop took {:?}", start.elapsed());
-        start = std::time::Instant::now();
         for (idx, command) in commands.into_iter().enumerate() {
             let start = Instant::now();
             if let Err(err) =
@@ -180,8 +169,6 @@ mod checked {
             };
             timings.push(ExecutionTiming::Success(start.elapsed()));
         }
-        tracing::trace!("After for loop took {:?}", start.elapsed());
-        start = std::time::Instant::now();
 
         // Save loaded objects table in case we fail in post execution
         let object_runtime: &ObjectRuntime = context.object_runtime()?;
@@ -199,7 +186,6 @@ mod checked {
         state_view.save_loaded_runtime_objects(loaded_runtime_objects);
         state_view.save_wrapped_object_containers(wrapped_object_containers);
         state_view.record_execution_results(finished?);
-        tracing::trace!("After finish took {:?}", start.elapsed());
         Ok(mode_results)
     }
 
