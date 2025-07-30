@@ -5,27 +5,24 @@ use super::writeback_cache::{
 };
 use super::{
     cache_types::{CacheResult, CachedVersionMap, MonotonicCache},
-    object_locks::ObjectLocks,
     ExecutionCacheMetrics, ObjectCacheRead,
 };
 use crate::authority::authority_per_epoch_store::AuthorityPerEpochStore;
-use crate::authority::authority_store::{LockDetailsDeprecated, ObjectLockStatus, SuiLockResult};
+use crate::authority::authority_store::SuiLockResult;
 use crate::authority::readonly_authority_store::ReadonlyAuthorityStore;
-use crate::fallback_fetch::{do_fallback_lookup, do_fallback_lookup_fallible};
 use crate::{check_cache_entry_by_latest, check_cache_entry_by_version};
 use dashmap::mapref::entry::Entry as DashMapEntry;
 use dashmap::DashMap;
-use futures::{future::BoxFuture, FutureExt};
+use futures::future::BoxFuture;
 use moka::sync::SegmentedCache as MokaCache;
 use mysten_common::random_util::randomize_cache_capacity_in_tests;
-use mysten_common::sync::notify_read::NotifyRead;
 use parking_lot::Mutex;
 use std::collections::HashSet;
 use std::hash::Hash;
 use std::sync::Arc;
 use sui_config::ExecutionCacheConfig;
 use sui_types::base_types::{EpochId, FullObjectID, ObjectID, ObjectRef, SequenceNumber};
-use sui_types::bridge::{get_bridge, Bridge};
+use sui_types::bridge::Bridge;
 use sui_types::digests::ObjectDigest;
 use sui_types::error::{SuiError, SuiResult, UserInputError};
 use sui_types::messages_checkpoint::CheckpointSequenceNumber;
@@ -33,8 +30,7 @@ use sui_types::object::Object;
 use sui_types::storage::{
     FullObjectKey, InputKey, MarkerValue, ObjectKey, ObjectOrTombstone, ObjectStore, PackageObject,
 };
-use sui_types::sui_system_state::{get_sui_system_state, SuiSystemState};
-use tap::TapOptional;
+use sui_types::sui_system_state::SuiSystemState;
 use tracing::{instrument, trace, warn};
 
 pub struct ReadonlyWritebackCache {
@@ -60,10 +56,6 @@ pub struct ReadonlyWritebackCache {
     //   we do not need to worry about the contiguous version property.
     // - note that we removed any unfinalized packages from the cache during revert_state_update().
     packages: MokaCache<ObjectID, PackageObject>,
-
-    object_locks: ObjectLocks,
-
-    object_notify_read: NotifyRead<InputKey, ()>,
 
     store: Arc<ReadonlyAuthorityStore>,
     metrics: Arc<ExecutionCacheMetrics>,
@@ -124,8 +116,6 @@ impl ReadonlyWritebackCache {
                 config.object_by_id_cache_size(),
             )),
             packages,
-            object_locks: ObjectLocks::new(),
-            object_notify_read: NotifyRead::new(),
             store,
             metrics,
             long_term_cache: MokaCache::builder(8)
@@ -288,67 +278,6 @@ impl ReadonlyWritebackCache {
         )
     }
 
-    fn get_object_by_id_cache_only(
-        &self,
-        request_type: &'static str,
-        object_id: &ObjectID,
-    ) -> CacheResult<(SequenceNumber, Object)> {
-        match self.get_object_entry_by_id_cache_only(request_type, object_id) {
-            CacheResult::Hit((version, entry)) => match entry {
-                ObjectEntry::Object(object) => CacheResult::Hit((version, object)),
-                ObjectEntry::Deleted | ObjectEntry::Wrapped => CacheResult::NegativeHit,
-            },
-            CacheResult::NegativeHit => CacheResult::NegativeHit,
-            CacheResult::Miss => CacheResult::Miss,
-        }
-    }
-
-    fn get_marker_value_cache_only(
-        &self,
-        object_key: FullObjectKey,
-        epoch_id: EpochId,
-    ) -> CacheResult<MarkerValue> {
-        Self::with_locked_cache_entries(
-            &self.dirty.markers,
-            &self.cached.marker_cache,
-            &(epoch_id, object_key.id()),
-            |dirty_entry, cached_entry| {
-                check_cache_entry_by_version!(
-                    self,
-                    "marker_by_version",
-                    "uncommitted",
-                    dirty_entry,
-                    object_key.version()
-                );
-                check_cache_entry_by_version!(
-                    self,
-                    "marker_by_version",
-                    "committed",
-                    cached_entry,
-                    object_key.version()
-                );
-                CacheResult::Miss
-            },
-        )
-    }
-
-    fn get_latest_marker_value_cache_only(
-        &self,
-        object_id: FullObjectID,
-        epoch_id: EpochId,
-    ) -> CacheResult<(SequenceNumber, MarkerValue)> {
-        Self::with_locked_cache_entries(
-            &self.dirty.markers,
-            &self.cached.marker_cache,
-            &(epoch_id, object_id),
-            |dirty_entry, cached_entry| {
-                check_cache_entry_by_latest!(self, "marker_latest", "uncommitted", dirty_entry);
-                check_cache_entry_by_latest!(self, "marker_latest", "committed", cached_entry);
-                CacheResult::Miss
-            },
-        )
-    }
-
     fn get_object_impl(&self, request_type: &'static str, id: &ObjectID) -> Option<Object> {
         let ticket = self.object_by_id_cache.get_ticket_for_read(id);
         match self.get_object_entry_by_id_cache_only(request_type, id) {
@@ -385,21 +314,6 @@ impl ReadonlyWritebackCache {
                 }
             }
         }
-    }
-
-    fn record_db_get(&self, request_type: &'static str) -> &ReadonlyAuthorityStore {
-        self.metrics.record_cache_request(request_type, "db");
-        &self.store
-    }
-
-    fn record_db_multi_get(
-        &self,
-        request_type: &'static str,
-        count: usize,
-    ) -> &ReadonlyAuthorityStore {
-        self.metrics
-            .record_cache_multi_request(request_type, "db", count);
-        &self.store
     }
 
     // Updates the latest object id cache with an entry that was read from the db.
@@ -498,433 +412,97 @@ impl ObjectCacheRead for ReadonlyWritebackCache {
         match self.get_object_by_key_cache_only(object_id, version) {
             CacheResult::Hit(object) => Some(object),
             CacheResult::NegativeHit => None,
-            CacheResult::Miss => self
-                .record_db_get("object_by_version")
-                .get_object_by_key(object_id, version),
+            CacheResult::Miss => self.store.get_object_by_key(object_id, version),
         }
     }
 
-    fn multi_get_objects_by_key(&self, object_keys: &[ObjectKey]) -> Vec<Option<Object>> {
-        do_fallback_lookup(
-            object_keys,
-            |key| match self.get_object_by_key_cache_only(&key.0, key.1) {
-                CacheResult::Hit(maybe_object) => CacheResult::Hit(Some(maybe_object)),
-                CacheResult::NegativeHit => CacheResult::NegativeHit,
-                CacheResult::Miss => CacheResult::Miss,
-            },
-            |remaining| {
-                self.record_db_multi_get("object_by_version", remaining.len())
-                    .multi_get_objects_by_key(remaining)
-                    .expect("db error")
-            },
-        )
+    fn multi_get_objects_by_key(&self, _object_keys: &[ObjectKey]) -> Vec<Option<Object>> {
+        panic!("multi_get_objects_by_key should not be called on ReadonlyWritebackCache");
     }
 
-    fn object_exists_by_key(&self, object_id: &ObjectID, version: SequenceNumber) -> bool {
-        match self.get_object_by_key_cache_only(object_id, version) {
-            CacheResult::Hit(_) => true,
-            CacheResult::NegativeHit => false,
-            CacheResult::Miss => self
-                .record_db_get("object_by_version")
-                .object_exists_by_key(object_id, version)
-                .expect("db error"),
-        }
+    fn object_exists_by_key(&self, _object_id: &ObjectID, _version: SequenceNumber) -> bool {
+        panic!("object_exists_by_key should not be called on ReadonlyWritebackCache");
     }
 
-    fn multi_object_exists_by_key(&self, object_keys: &[ObjectKey]) -> Vec<bool> {
-        do_fallback_lookup(
-            object_keys,
-            |key| match self.get_object_by_key_cache_only(&key.0, key.1) {
-                CacheResult::Hit(_) => CacheResult::Hit(true),
-                CacheResult::NegativeHit => CacheResult::Hit(false),
-                CacheResult::Miss => CacheResult::Miss,
-            },
-            |remaining| {
-                self.record_db_multi_get("object_by_version", remaining.len())
-                    .multi_object_exists_by_key(remaining)
-                    .expect("db error")
-            },
-        )
+    fn multi_object_exists_by_key(&self, _object_keys: &[ObjectKey]) -> Vec<bool> {
+        panic!("multi_object_exists_by_key should not be called on ReadonlyWritebackCache");
     }
 
-    fn get_latest_object_ref_or_tombstone(&self, object_id: ObjectID) -> Option<ObjectRef> {
-        match self.get_object_entry_by_id_cache_only("latest_objref_or_tombstone", &object_id) {
-            CacheResult::Hit((version, entry)) => Some(match entry {
-                ObjectEntry::Object(object) => object.compute_object_reference(),
-                ObjectEntry::Deleted => (object_id, version, ObjectDigest::OBJECT_DIGEST_DELETED),
-                ObjectEntry::Wrapped => (object_id, version, ObjectDigest::OBJECT_DIGEST_WRAPPED),
-            }),
-            CacheResult::NegativeHit => None,
-            CacheResult::Miss => self
-                .record_db_get("latest_objref_or_tombstone")
-                .get_latest_object_ref_or_tombstone(object_id)
-                .expect("db error"),
-        }
+    fn get_latest_object_ref_or_tombstone(&self, _object_id: ObjectID) -> Option<ObjectRef> {
+        panic!("get_latest_object_ref_or_tombstone should not be called on ReadonlyWritebackCache");
     }
 
     fn get_latest_object_or_tombstone(
         &self,
-        object_id: ObjectID,
+        _object_id: ObjectID,
     ) -> Option<(ObjectKey, ObjectOrTombstone)> {
-        match self.get_object_entry_by_id_cache_only("latest_object_or_tombstone", &object_id) {
-            CacheResult::Hit((version, entry)) => {
-                let key = ObjectKey(object_id, version);
-                Some(match entry {
-                    ObjectEntry::Object(object) => (key, object.into()),
-                    ObjectEntry::Deleted => (
-                        key,
-                        ObjectOrTombstone::Tombstone((
-                            object_id,
-                            version,
-                            ObjectDigest::OBJECT_DIGEST_DELETED,
-                        )),
-                    ),
-                    ObjectEntry::Wrapped => (
-                        key,
-                        ObjectOrTombstone::Tombstone((
-                            object_id,
-                            version,
-                            ObjectDigest::OBJECT_DIGEST_WRAPPED,
-                        )),
-                    ),
-                })
-            }
-            CacheResult::NegativeHit => None,
-            CacheResult::Miss => self
-                .record_db_get("latest_object_or_tombstone")
-                .get_latest_object_or_tombstone(object_id)
-                .expect("db error"),
-        }
+        panic!("get_latest_object_or_tombstone should not be called on ReadonlyWritebackCache");
     }
 
-    fn multi_input_objects_available_cache_only(&self, keys: &[InputKey]) -> Vec<bool> {
-        keys.iter()
-            .map(|key| {
-                if key.is_cancelled() {
-                    true
-                } else {
-                    match key {
-                        InputKey::VersionedObject { id, version } => {
-                            matches!(
-                                self.get_object_by_key_cache_only(&id.id(), *version),
-                                CacheResult::Hit(_)
-                            )
-                        }
-                        InputKey::Package { id } => self.packages.contains_key(id),
-                    }
-                }
-            })
-            .collect()
+    fn multi_input_objects_available_cache_only(&self, _keys: &[InputKey]) -> Vec<bool> {
+        panic!("multi_input_objects_available_cache_only should not be called on ReadonlyWritebackCache");
     }
 
     #[instrument(level = "trace", skip_all, fields(object_id, version_bound))]
     fn find_object_lt_or_eq_version(
         &self,
-        object_id: ObjectID,
-        version_bound: SequenceNumber,
+        _object_id: ObjectID,
+        _version_bound: SequenceNumber,
     ) -> Option<Object> {
-        macro_rules! check_cache_entry {
-            ($level: expr, $objects: expr) => {
-                self.metrics
-                    .record_cache_request("object_lt_or_eq_version", $level);
-                if let Some(objects) = $objects {
-                    if let Some((_, object)) = objects
-                        .all_versions_lt_or_eq_descending(&version_bound)
-                        .next()
-                    {
-                        if let ObjectEntry::Object(object) = object {
-                            self.metrics
-                                .record_cache_hit("object_lt_or_eq_version", $level);
-                            return Some(object.clone());
-                        } else {
-                            // if we find a tombstone, the object does not exist
-                            self.metrics
-                                .record_cache_negative_hit("object_lt_or_eq_version", $level);
-                            return None;
-                        }
-                    } else {
-                        self.metrics
-                            .record_cache_miss("object_lt_or_eq_version", $level);
-                    }
-                }
-            };
-        }
-
-        // if we have the latest version cached, and it is within the bound, we are done
-        self.metrics
-            .record_cache_request("object_lt_or_eq_version", "object_by_id");
-        let latest_cache_entry = self.object_by_id_cache.get(&object_id);
-        if let Some(latest) = &latest_cache_entry {
-            let latest = latest.lock();
-            match &*latest {
-                LatestObjectCacheEntry::Object(latest_version, object) => {
-                    if *latest_version <= version_bound {
-                        if let ObjectEntry::Object(object) = object {
-                            self.metrics
-                                .record_cache_hit("object_lt_or_eq_version", "object_by_id");
-                            return Some(object.clone());
-                        } else {
-                            // object is a tombstone, but is still within the version bound
-                            self.metrics.record_cache_negative_hit(
-                                "object_lt_or_eq_version",
-                                "object_by_id",
-                            );
-                            return None;
-                        }
-                    }
-                    // latest object is not within the version bound. fall through.
-                }
-                // No object by this ID exists at all
-                LatestObjectCacheEntry::NonExistent => {
-                    self.metrics
-                        .record_cache_negative_hit("object_lt_or_eq_version", "object_by_id");
-                    return None;
-                }
-            }
-        }
-        self.metrics
-            .record_cache_miss("object_lt_or_eq_version", "object_by_id");
-
-        Self::with_locked_cache_entries(
-            &self.dirty.objects,
-            &self.cached.object_cache,
-            &object_id,
-            |dirty_entry, cached_entry| {
-                check_cache_entry!("committed", dirty_entry);
-                check_cache_entry!("uncommitted", cached_entry);
-
-                // Much of the time, the query will be for the very latest object version, so
-                // try that first. But we have to be careful:
-                // 1. We must load the tombstone if it is present, because its version may exceed
-                //    the version_bound, in which case we must do a scan.
-                // 2. You might think we could just call `self.store.get_latest_object_or_tombstone` here.
-                //    But we cannot, because there may be a more recent version in the dirty set, which
-                //    we skipped over in check_cache_entry! because of the version bound. However, if we
-                //    skipped it above, we will skip it here as well, again due to the version bound.
-                // 3. Despite that, we really want to warm the cache here. Why? Because if the object is
-                //    cold (not being written to), then we will very soon be able to start serving reads
-                //    of it from the object_by_id cache, IF we can warm the cache. If we don't warm the
-                //    the cache here, and no writes to the object occur, then we will always have to go
-                //    to the db for the object.
-                //
-                // Lastly, it is important to understand the rationale for all this: If the object is
-                // write-hot, we will serve almost all reads to it from the dirty set (or possibly the
-                // cached set if it is only written to once every few checkpoints). If the object is
-                // write-cold (or non-existent) and read-hot, then we will serve almost all reads to it
-                // from the object_by_id cache check above.  Most of the apparently wasteful code here
-                // exists only to ensure correctness in all the edge cases.
-                let latest: Option<(SequenceNumber, ObjectEntry)> =
-                    if let Some(dirty_set) = dirty_entry {
-                        dirty_set
-                            .get_highest()
-                            .cloned()
-                            .tap_none(|| panic!("dirty set cannot be empty"))
-                    } else {
-                        // TODO: we should try not to read from the db while holding the locks.
-                        self.record_db_get("object_lt_or_eq_version_latest")
-                            .get_latest_object_or_tombstone(object_id)
-                            .expect("db error")
-                            .map(|(ObjectKey(_, version), obj_or_tombstone)| {
-                                (version, ObjectEntry::from(obj_or_tombstone))
-                            })
-                    };
-
-                if let Some((obj_version, obj_entry)) = latest {
-                    // we can always cache the latest object (or tombstone), even if it is not within the
-                    // version_bound. This is done in order to warm the cache in the case where a sequence
-                    // of transactions all read the same child object without writing to it.
-
-                    // Note: no need to call with_object_by_id_cache_update here, because we are holding
-                    // the lock on the dirty cache entry, and `latest` cannot become out-of-date
-                    // while we hold that lock.
-                    self.cache_latest_object_by_id(
-                        &object_id,
-                        LatestObjectCacheEntry::Object(obj_version, obj_entry.clone()),
-                        // We can get a ticket at the last second, because we are holding the lock
-                        // on dirty, so there cannot be any concurrent writes.
-                        self.object_by_id_cache.get_ticket_for_read(&object_id),
-                    );
-
-                    if obj_version <= version_bound {
-                        match obj_entry {
-                            ObjectEntry::Object(object) => Some(object),
-                            ObjectEntry::Deleted | ObjectEntry::Wrapped => None,
-                        }
-                    } else {
-                        // The latest object exceeded the bound, so now we have to do a scan
-                        // But we already know there is no dirty entry within the bound,
-                        // so we go to the db.
-                        self.record_db_get("object_lt_or_eq_version_scan")
-                            .find_object_lt_or_eq_version(object_id, version_bound)
-                            .expect("db error")
-                    }
-
-                // no object found in dirty set or db, object does not exist
-                // When this is called from a read api (i.e. not the execution path) it is
-                // possible that the object has been deleted and pruned. In this case,
-                // there would be no entry at all on disk, but we may have a tombstone in the
-                // cache
-                } else if let Some(latest_cache_entry) = latest_cache_entry {
-                    // If there is a latest cache entry, it had better not be a live object!
-                    assert!(!latest_cache_entry.lock().is_alive());
-                    None
-                } else {
-                    // If there is no latest cache entry, we can insert one.
-                    let highest = cached_entry.and_then(|c| c.get_highest());
-                    assert!(highest.is_none() || highest.unwrap().1.is_tombstone());
-                    self.cache_object_not_found(
-                        &object_id,
-                        // okay to get ticket at last second - see above
-                        self.object_by_id_cache.get_ticket_for_read(&object_id),
-                    );
-                    None
-                }
-            },
-        )
+        panic!("find_object_lt_or_eq_version should not be called on ReadonlyWritebackCache");
     }
 
     fn get_sui_system_state_object_unsafe(&self) -> SuiResult<SuiSystemState> {
-        get_sui_system_state(self)
+        panic!("get_sui_system_state_object_unsafe should not be called on ReadonlyWritebackCache");
     }
 
     fn get_bridge_object_unsafe(&self) -> SuiResult<Bridge> {
-        get_bridge(self)
+        panic!("get_bridge_object_unsafe should not be called on ReadonlyWritebackCache");
     }
 
     fn get_marker_value(
         &self,
-        object_key: FullObjectKey,
-        epoch_id: EpochId,
+        _object_key: FullObjectKey,
+        _epoch_id: EpochId,
     ) -> Option<MarkerValue> {
-        match self.get_marker_value_cache_only(object_key, epoch_id) {
-            CacheResult::Hit(marker) => Some(marker),
-            CacheResult::NegativeHit => None,
-            CacheResult::Miss => self
-                .record_db_get("marker_by_version")
-                .get_marker_value(object_key, epoch_id)
-                .expect("db error"),
-        }
+        panic!("get_marker_value should not be called on ReadonlyWritebackCache");
     }
 
     fn get_latest_marker(
         &self,
-        object_id: FullObjectID,
-        epoch_id: EpochId,
+        _object_id: FullObjectID,
+        _epoch_id: EpochId,
     ) -> Option<(SequenceNumber, MarkerValue)> {
-        match self.get_latest_marker_value_cache_only(object_id, epoch_id) {
-            CacheResult::Hit((v, marker)) => Some((v, marker)),
-            CacheResult::NegativeHit => {
-                panic!("cannot have negative hit when getting latest marker")
-            }
-            CacheResult::Miss => self
-                .record_db_get("marker_latest")
-                .get_latest_marker(object_id, epoch_id)
-                .expect("db error"),
-        }
+        panic!("get_latest_marker should not be called on ReadonlyWritebackCache");
     }
 
-    fn get_lock(&self, obj_ref: ObjectRef, epoch_store: &AuthorityPerEpochStore) -> SuiLockResult {
-        let cur_epoch = epoch_store.epoch();
-        match self.get_object_by_id_cache_only("lock", &obj_ref.0) {
-            CacheResult::Hit((_, obj)) => {
-                let actual_objref = obj.compute_object_reference();
-                if obj_ref != actual_objref {
-                    Ok(ObjectLockStatus::LockedAtDifferentVersion {
-                        locked_ref: actual_objref,
-                    })
-                } else {
-                    // requested object ref is live, check if there is a lock
-                    Ok(
-                        match self
-                            .object_locks
-                            .get_transaction_lock(&obj_ref, epoch_store)?
-                        {
-                            Some(tx_digest) => ObjectLockStatus::LockedToTx {
-                                locked_by_tx: LockDetailsDeprecated {
-                                    epoch: cur_epoch,
-                                    tx_digest,
-                                },
-                            },
-                            None => ObjectLockStatus::Initialized,
-                        },
-                    )
-                }
-            }
-            CacheResult::NegativeHit => {
-                Err(SuiError::from(UserInputError::ObjectNotFound {
-                    object_id: obj_ref.0,
-                    // even though we know the requested version, we leave it as None to indicate
-                    // that the object does not exist at any version
-                    version: None,
-                }))
-            }
-            CacheResult::Miss => self.record_db_get("lock").get_lock(obj_ref, epoch_store),
-        }
+    fn get_lock(
+        &self,
+        _obj_ref: ObjectRef,
+        _epoch_store: &AuthorityPerEpochStore,
+    ) -> SuiLockResult {
+        panic!("get_lock should not be called on ReadonlyWritebackCache");
     }
 
-    fn _get_live_objref(&self, object_id: ObjectID) -> SuiResult<ObjectRef> {
-        let obj = self.get_object_impl("live_objref", &object_id).ok_or(
-            UserInputError::ObjectNotFound {
-                object_id,
-                version: None,
-            },
-        )?;
-        Ok(obj.compute_object_reference())
+    fn _get_live_objref(&self, _object_id: ObjectID) -> SuiResult<ObjectRef> {
+        panic!("_get_live_objref should not be called on ReadonlyWritebackCache");
     }
 
-    fn check_owned_objects_are_live(&self, owned_object_refs: &[ObjectRef]) -> SuiResult {
-        do_fallback_lookup_fallible(
-            owned_object_refs,
-            |obj_ref| match self.get_object_by_id_cache_only("object_is_live", &obj_ref.0) {
-                CacheResult::Hit((version, obj)) => {
-                    if obj.compute_object_reference() != *obj_ref {
-                        Err(UserInputError::ObjectVersionUnavailableForConsumption {
-                            provided_obj_ref: *obj_ref,
-                            current_version: version,
-                        }
-                        .into())
-                    } else {
-                        Ok(CacheResult::Hit(()))
-                    }
-                }
-                CacheResult::NegativeHit => Err(UserInputError::ObjectNotFound {
-                    object_id: obj_ref.0,
-                    version: None,
-                }
-                .into()),
-                CacheResult::Miss => Ok(CacheResult::Miss),
-            },
-            |remaining| {
-                self.record_db_multi_get("object_is_live", remaining.len())
-                    .check_owned_objects_are_live(remaining)?;
-                Ok(vec![(); remaining.len()])
-            },
-        )?;
-        Ok(())
+    fn check_owned_objects_are_live(&self, _owned_object_refs: &[ObjectRef]) -> SuiResult {
+        panic!("check_owned_objects_are_live should not be called on ReadonlyWritebackCache");
     }
 
     fn get_highest_pruned_checkpoint(&self) -> Option<CheckpointSequenceNumber> {
-        self.store
-            .perpetual_tables
-            .get_highest_pruned_checkpoint()
-            .expect("db error")
+        panic!("get_highest_pruned_checkpoint should not be called on ReadonlyWritebackCache");
     }
 
     fn notify_read_input_objects<'a>(
         &'a self,
-        input_and_receiving_keys: &'a [InputKey],
-        receiving_keys: &'a HashSet<InputKey>,
-        epoch: &'a EpochId,
+        _input_and_receiving_keys: &'a [InputKey],
+        _receiving_keys: &'a HashSet<InputKey>,
+        _epoch: &'a EpochId,
     ) -> BoxFuture<'a, ()> {
-        self.object_notify_read
-            .read(input_and_receiving_keys, |keys| {
-                self.multi_input_objects_available(keys, receiving_keys, epoch)
-                    .into_iter()
-                    .map(|available| if available { Some(()) } else { None })
-                    .collect::<Vec<_>>()
-            })
-            .map(|_| ())
-            .boxed()
+        panic!("notify_read_input_objects should not be called on ReadonlyWritebackCache");
     }
 }
 
