@@ -1406,6 +1406,8 @@ impl Loader {
                     .map_err(|e| e.finish(Location::Undefined))?,
                 self_id.clone(),
             );
+            tracing::trace!("inside loop link context took: {:?}", start.elapsed());
+            start = std::time::Instant::now();
             if !bundle_verified.contains_key(&self_id)
                 && !self
                     .module_cache
