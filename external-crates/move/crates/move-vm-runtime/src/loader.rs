@@ -774,12 +774,16 @@ impl<'a> ModuleLoader<'a> {
         data_store: &impl DataStore,
         allow_loading_failure: bool,
     ) -> VMResult<(ModuleId, Arc<CompiledModule>)> {
+        let mut start = std::time::Instant::now();
         let (storage_id, module) =
             loader.verify_module(&runtime_id, data_store, allow_loading_failure)?;
+        tracing::trace!("Verify module took {:?}", start.elapsed());
+        start = std::time::Instant::now();
         self.stack.push(StackEntry {
             module: ModuleEntry::new(module.clone()),
             deps: module.immediate_dependencies(),
         });
+        tracing::trace!("Push module took {:?}", start.elapsed());
         Ok((storage_id, module))
     }
 
@@ -1323,19 +1327,23 @@ impl Loader {
         data_store: &impl DataStore,
         allow_loading_failure: bool,
     ) -> VMResult<(ModuleId, Arc<CompiledModule>)> {
+        let mut start = std::time::Instant::now();
         let storage_id = data_store
             .relocate(runtime_id)
             .map_err(|e| e.finish(Location::Undefined))?;
         if let Some(cached) = self.module_cache.read().compiled_module_at(&storage_id) {
             return Ok((storage_id, cached));
         }
-
+        tracing::trace!("verify module relocate took {:?}", start.elapsed());
+        start = std::time::Instant::now();
         let module = self.read_module_from_store(
             runtime_id,
             &storage_id,
             data_store,
             allow_loading_failure,
         )?;
+        tracing::trace!("verify module read from store took {:?}", start.elapsed());
+        start = std::time::Instant::now();
 
         let cached = self
             .module_cache
@@ -1344,6 +1352,7 @@ impl Loader {
             .insert(storage_id.clone(), module)
             .map_err(|e| e.finish(Location::Module(storage_id.clone())))?
             .clone();
+        tracing::trace!("verify module insert into cache took {:?}", start.elapsed());
 
         Ok((storage_id, cached))
     }
