@@ -1396,6 +1396,7 @@ mod checked {
         new_packages: &[MovePackage],
         struct_tag: &StructTag,
     ) -> VMResult<Type> {
+        let mut start = std::time::Instant::now();
         fn verification_error<T>(code: StatusCode) -> VMResult<T> {
             Err(PartialVMError::new(code).finish(Location::Undefined))
         }
@@ -1410,8 +1411,20 @@ mod checked {
         // Load the package that the struct is defined in, in storage
         let defining_id = ObjectID::from_address(*address);
 
+        tracing::trace!(
+            "Loading type from struct with defining took {:?}",
+            start.elapsed()
+        );
         let data_store = SuiDataStore::new(linkage_view, new_packages);
+        tracing::trace!(
+            "Loading type from struct with data store took {:?}",
+            start.elapsed()
+        );
         let move_package = get_package(&data_store, defining_id)?;
+        tracing::trace!(
+            "Loading type from struct with move package took {:?}",
+            start.elapsed()
+        );
 
         // Set the defining package as the link context while loading the
         // struct
@@ -1423,7 +1436,15 @@ mod checked {
 
         let runtime_id = ModuleId::new(original_address, module.clone());
         let data_store = SuiDataStore::new(linkage_view, new_packages);
+        tracing::trace!(
+            "Loading type from struct second data store took {:?}",
+            start.elapsed()
+        );
         let res = vm.get_runtime().load_type(&runtime_id, name, &data_store);
+        tracing::trace!(
+            "Loading type from struct with load type took {:?}",
+            start.elapsed()
+        );
         linkage_view.reset_linkage().map_err(|e| {
             PartialVMError::new(StatusCode::UNKNOWN_INVARIANT_VIOLATION_ERROR)
                 .with_message(e.to_string())
@@ -1437,7 +1458,7 @@ mod checked {
             return verification_error(StatusCode::NUMBER_OF_TYPE_ARGUMENTS_MISMATCH);
         }
 
-        if type_params.is_empty() {
+        let res = if type_params.is_empty() {
             Ok(Type::Datatype(idx))
         } else {
             let loaded_type_params = type_params
@@ -1457,7 +1478,12 @@ mod checked {
                 idx,
                 loaded_type_params,
             ))))
-        }
+        };
+        tracing::trace!(
+            "Loading type from struct with final type took {:?}",
+            start.elapsed()
+        );
+        res
     }
 
     /// Load `type_tag` to get a `Type` in the provided `session`.  `session`'s linkage context may be
