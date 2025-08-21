@@ -46,6 +46,8 @@ use typed_store::rocks::DBBatch;
 pub(crate) mod cache_types;
 pub mod metrics;
 mod object_locks;
+pub mod readonly_execution_cache;
+pub mod readonly_writeback_cache;
 pub mod writeback_cache;
 
 pub use writeback_cache::WritebackCache;
@@ -685,6 +687,7 @@ pub trait TestingAPI: Send + Sync {
     fn database_for_testing(&self) -> Arc<AuthorityStore>;
 }
 
+#[macro_export]
 macro_rules! implement_storage_traits {
     ($implementor: ident) => {
         impl ObjectStore for $implementor {
