@@ -313,8 +313,14 @@ impl ObjectCacheRead for ReadonlyWritebackCache {
         panic!("get_lock should not be called on ReadonlyWritebackCache");
     }
 
-    fn _get_live_objref(&self, _object_id: ObjectID) -> SuiResult<ObjectRef> {
-        panic!("_get_live_objref should not be called on ReadonlyWritebackCache");
+    fn _get_live_objref(&self, object_id: ObjectID) -> SuiResult<ObjectRef> {
+        let obj = self.get_object_impl("live_objref", &object_id).ok_or(
+            UserInputError::ObjectNotFound {
+                object_id,
+                version: None,
+            },
+        )?;
+        Ok(obj.compute_object_reference())
     }
 
     fn check_owned_objects_are_live(&self, _owned_object_refs: &[ObjectRef]) -> SuiResult {
