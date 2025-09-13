@@ -344,7 +344,7 @@ impl ObjectCacheRead for ReadonlyWritebackCache {
 impl ReadonlyCacheInvalidator for ReadonlyWritebackCache {
     fn invalidate_objects(&self, object_ids: &[ObjectID]) -> SuiResult {
         object_ids.iter().for_each(|id| {
-            self.obj_cache.invalidate(id);
+            // self.obj_cache.invalidate(id);
             // self.obj_lt_eq_version.invalidate(id);
             // self.obj_by_key.invalidate(id);
         });
@@ -354,7 +354,7 @@ impl ReadonlyCacheInvalidator for ReadonlyWritebackCache {
     fn invalidate_all_objects(&self) -> SuiResult {
         // self.obj_by_key.invalidate_all();
         // self.obj_lt_eq_version.invalidate_all();
-        self.obj_cache.invalidate_all();
+        // self.obj_cache.invalidate_all();
         Ok(())
     }
 }
