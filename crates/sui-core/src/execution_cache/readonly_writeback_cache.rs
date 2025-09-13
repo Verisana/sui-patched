@@ -155,11 +155,11 @@ impl ReadonlyWritebackCache {
         Self {
             packages,
             store,
-            obj_cache: MokaCache::builder(8)
-                .max_capacity(randomize_cache_capacity_in_tests(
-                    config.object_cache_size(),
-                ))
-                .build(),
+            // obj_cache: MokaCache::builder(8)
+            //     .max_capacity(randomize_cache_capacity_in_tests(
+            //         config.object_cache_size(),
+            //     ))
+            //     .build(),
             // obj_lt_eq_version: MokaCache::builder(8)
             //     .max_capacity(randomize_cache_capacity_in_tests(
             //         config.object_cache_size(),
@@ -182,6 +182,7 @@ impl ReadonlyWritebackCache {
             .get_latest_object_or_tombstone(*id)
             .expect("db error");
         // self.cache_long_term_obj(id, &obj);
+
         match obj {
             Some((_, obj)) => match obj {
                 ObjectOrTombstone::Object(object) => Some(object),
