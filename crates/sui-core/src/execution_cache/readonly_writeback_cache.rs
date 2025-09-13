@@ -27,45 +27,44 @@ pub struct ReadonlyWritebackCache {
     store: Arc<ReadonlyAuthorityStore>,
 
     packages: MokaCache<ObjectID, Option<PackageObject>>,
-
-    obj_cache: MokaCache<ObjectID, LatestObjectCacheEntry>,
+    // obj_cache: MokaCache<ObjectID, LatestObjectCacheEntry>,
     // obj_lt_eq_version: MokaCache<ObjectID, DashMap<SequenceNumber, Option<Object>>>,
     // obj_by_key: MokaCache<ObjectID, DashMap<SequenceNumber, Option<Object>>>,
 }
 
 impl ReadonlyWritebackCache {
-    fn check_long_term_cache(&self, id: &ObjectID) -> Option<Option<Object>> {
-        match self.obj_cache.get(id) {
-            Some(latest) => match latest {
-                LatestObjectCacheEntry::Object(_, obj_entry) => match obj_entry {
-                    ObjectEntry::Object(obj) => Some(Some(obj)),
-                    ObjectEntry::Deleted | ObjectEntry::Wrapped => Some(None),
-                },
-                LatestObjectCacheEntry::NonExistent => None,
-            },
-            None => None,
-        }
-    }
+    // fn check_long_term_cache(&self, id: &ObjectID) -> Option<Option<Object>> {
+    //     match self.obj_cache.get(id) {
+    //         Some(latest) => match latest {
+    //             LatestObjectCacheEntry::Object(_, obj_entry) => match obj_entry {
+    //                 ObjectEntry::Object(obj) => Some(Some(obj)),
+    //                 ObjectEntry::Deleted | ObjectEntry::Wrapped => Some(None),
+    //             },
+    //             LatestObjectCacheEntry::NonExistent => None,
+    //         },
+    //         None => None,
+    //     }
+    // }
 
-    fn cache_long_term_obj(&self, id: &ObjectID, entry: &Option<(ObjectKey, ObjectOrTombstone)>) {
-        let value = match entry {
-            Some((key, obj_or_tombstone)) => match obj_or_tombstone {
-                ObjectOrTombstone::Object(obj) => {
-                    LatestObjectCacheEntry::Object(key.1, ObjectEntry::Object(obj.clone()))
-                }
-                ObjectOrTombstone::Tombstone((_, sequence, digest)) => {
-                    if digest == &ObjectDigest::OBJECT_DIGEST_DELETED {
-                        LatestObjectCacheEntry::Object(*sequence, ObjectEntry::Deleted)
-                    } else {
-                        LatestObjectCacheEntry::Object(*sequence, ObjectEntry::Wrapped)
-                    }
-                }
-            },
-            None => LatestObjectCacheEntry::NonExistent,
-        };
-
-        self.obj_cache.insert(*id, value);
-    }
+    // fn cache_long_term_obj(&self, id: &ObjectID, entry: &Option<(ObjectKey, ObjectOrTombstone)>) {
+    //     let value = match entry {
+    //         Some((key, obj_or_tombstone)) => match obj_or_tombstone {
+    //             ObjectOrTombstone::Object(obj) => {
+    //                 LatestObjectCacheEntry::Object(key.1, ObjectEntry::Object(obj.clone()))
+    //             }
+    //             ObjectOrTombstone::Tombstone((_, sequence, digest)) => {
+    //                 if digest == &ObjectDigest::OBJECT_DIGEST_DELETED {
+    //                     LatestObjectCacheEntry::Object(*sequence, ObjectEntry::Deleted)
+    //                 } else {
+    //                     LatestObjectCacheEntry::Object(*sequence, ObjectEntry::Wrapped)
+    //                 }
+    //             }
+    //         },
+    //         None => LatestObjectCacheEntry::NonExistent,
+    //     };
+    //
+    //     self.obj_cache.insert(*id, value);
+    // }
 
     // fn check_long_term_lt_eq_version_cache(
     //     &self,
@@ -175,14 +174,14 @@ impl ReadonlyWritebackCache {
     }
 
     fn get_object_impl(&self, id: &ObjectID) -> Option<Object> {
-        if let Some(object) = self.check_long_term_cache(id) {
-            return object;
-        }
+        // if let Some(object) = self.check_long_term_cache(id) {
+        //     return object;
+        // }
         let obj = self
             .store
             .get_latest_object_or_tombstone(*id)
             .expect("db error");
-        self.cache_long_term_obj(id, &obj);
+        // self.cache_long_term_obj(id, &obj);
         match obj {
             Some((_, obj)) => match obj {
                 ObjectOrTombstone::Object(object) => Some(object),
