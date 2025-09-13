@@ -314,12 +314,12 @@ impl ObjectCacheRead for ReadonlyWritebackCache {
     }
 
     fn _get_live_objref(&self, object_id: ObjectID) -> SuiResult<ObjectRef> {
-        let obj = self.get_object_impl("live_objref", &object_id).ok_or(
-            UserInputError::ObjectNotFound {
+        let obj = self
+            .get_object_impl(&object_id)
+            .ok_or(UserInputError::ObjectNotFound {
                 object_id,
                 version: None,
-            },
-        )?;
+            })?;
         Ok(obj.compute_object_reference())
     }
 
