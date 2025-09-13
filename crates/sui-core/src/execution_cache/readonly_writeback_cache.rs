@@ -29,8 +29,8 @@ pub struct ReadonlyWritebackCache {
     packages: MokaCache<ObjectID, Option<PackageObject>>,
 
     obj_cache: MokaCache<ObjectID, LatestObjectCacheEntry>,
-    obj_lt_eq_version: MokaCache<ObjectID, DashMap<SequenceNumber, Option<Object>>>,
-    obj_by_key: MokaCache<ObjectID, DashMap<SequenceNumber, Option<Object>>>,
+    // obj_lt_eq_version: MokaCache<ObjectID, DashMap<SequenceNumber, Option<Object>>>,
+    // obj_by_key: MokaCache<ObjectID, DashMap<SequenceNumber, Option<Object>>>,
 }
 
 impl ReadonlyWritebackCache {
@@ -67,33 +67,33 @@ impl ReadonlyWritebackCache {
         self.obj_cache.insert(*id, value);
     }
 
-    fn check_long_term_lt_eq_version_cache(
-        &self,
-        id: &ObjectID,
-        version: SequenceNumber,
-    ) -> Option<Option<Object>> {
-        self.obj_lt_eq_version
-            .get(id)?
-            .get(&version)
-            .map(|entry| entry.clone())
-    }
+    // fn check_long_term_lt_eq_version_cache(
+    //     &self,
+    //     id: &ObjectID,
+    //     version: SequenceNumber,
+    // ) -> Option<Option<Object>> {
+    //     self.obj_lt_eq_version
+    //         .get(id)?
+    //         .get(&version)
+    //         .map(|entry| entry.clone())
+    // }
 
-    fn cache_long_term_lt_eq_version(
-        &self,
-        id: &ObjectID,
-        version: SequenceNumber,
-        entry: &Option<Object>,
-    ) {
-        match self.obj_lt_eq_version.get(id) {
-            Some(entries) => {
-                entries.insert(version, entry.clone());
-            }
-            None => {
-                self.obj_lt_eq_version
-                    .insert(*id, DashMap::from_iter([(version, entry.clone())]));
-            }
-        }
-    }
+    // fn cache_long_term_lt_eq_version(
+    //     &self,
+    //     id: &ObjectID,
+    //     version: SequenceNumber,
+    //     entry: &Option<Object>,
+    // ) {
+    //     match self.obj_lt_eq_version.get(id) {
+    //         Some(entries) => {
+    //             entries.insert(version, entry.clone());
+    //         }
+    //         None => {
+    //             self.obj_lt_eq_version
+    //                 .insert(*id, DashMap::from_iter([(version, entry.clone())]));
+    //         }
+    //     }
+    // }
 
     fn check_package_cache(&self, id: &ObjectID) -> Option<Option<PackageObject>> {
         self.packages.get(id)
@@ -103,44 +103,44 @@ impl ReadonlyWritebackCache {
         self.packages.insert(id, package);
     }
 
-    fn check_long_term_object_by_key(
-        &self,
-        id: &ObjectID,
-        version: SequenceNumber,
-    ) -> Option<Option<Object>> {
-        self.obj_by_key
-            .get(id)?
-            .get(&version)
-            .map(|entry| entry.clone())
-    }
+    // fn check_long_term_object_by_key(
+    //     &self,
+    //     id: &ObjectID,
+    //     version: SequenceNumber,
+    // ) -> Option<Option<Object>> {
+    //     self.obj_by_key
+    //         .get(id)?
+    //         .get(&version)
+    //         .map(|entry| entry.clone())
+    // }
 
-    fn cache_long_term_object_by_key(
-        &self,
-        id: &ObjectID,
-        version: SequenceNumber,
-        entry: &Option<Object>,
-    ) {
-        match self.obj_by_key.get(id) {
-            Some(entries) => {
-                entries.insert(version, entry.clone());
-            }
-            None => {
-                self.obj_by_key
-                    .insert(*id, DashMap::from_iter([(version, entry.clone())]));
-            }
-        }
-    }
+    // fn cache_long_term_object_by_key(
+    //     &self,
+    //     id: &ObjectID,
+    //     version: SequenceNumber,
+    //     entry: &Option<Object>,
+    // ) {
+    //     match self.obj_by_key.get(id) {
+    //         Some(entries) => {
+    //             entries.insert(version, entry.clone());
+    //         }
+    //         None => {
+    //             self.obj_by_key
+    //                 .insert(*id, DashMap::from_iter([(version, entry.clone())]));
+    //         }
+    //     }
+    // }
 
     fn get_object_by_key_impl(
         &self,
         object_id: &ObjectID,
         version: SequenceNumber,
     ) -> Option<Object> {
-        if let Some(object) = self.check_long_term_object_by_key(object_id, version) {
-            return object;
-        }
+        // if let Some(object) = self.check_long_term_object_by_key(object_id, version) {
+        //     return object;
+        // }
         let obj = self.store.get_object_by_key(object_id, version);
-        self.cache_long_term_object_by_key(object_id, version, &obj);
+        // self.cache_long_term_object_by_key(object_id, version, &obj);
 
         obj
     }
@@ -161,16 +161,16 @@ impl ReadonlyWritebackCache {
                     config.object_cache_size(),
                 ))
                 .build(),
-            obj_lt_eq_version: MokaCache::builder(8)
-                .max_capacity(randomize_cache_capacity_in_tests(
-                    config.object_cache_size(),
-                ))
-                .build(),
-            obj_by_key: MokaCache::builder(8)
-                .max_capacity(randomize_cache_capacity_in_tests(
-                    config.object_cache_size(),
-                ))
-                .build(),
+            // obj_lt_eq_version: MokaCache::builder(8)
+            //     .max_capacity(randomize_cache_capacity_in_tests(
+            //         config.object_cache_size(),
+            //     ))
+            //     .build(),
+            // obj_by_key: MokaCache::builder(8)
+            //     .max_capacity(randomize_cache_capacity_in_tests(
+            //         config.object_cache_size(),
+            //     ))
+            //     .build(),
         }
     }
 
@@ -268,16 +268,16 @@ impl ObjectCacheRead for ReadonlyWritebackCache {
         object_id: ObjectID,
         version_bound: SequenceNumber,
     ) -> Option<Object> {
-        if let Some(object) = self.check_long_term_lt_eq_version_cache(&object_id, version_bound) {
-            return object;
-        }
+        // if let Some(object) = self.check_long_term_lt_eq_version_cache(&object_id, version_bound) {
+        //     return object;
+        // }
         let obj = ReadonlyAuthorityStore::find_object_lt_or_eq_version(
             &self.store,
             object_id,
             version_bound,
         )
         .expect("db error");
-        self.cache_long_term_lt_eq_version(&object_id, version_bound, &obj);
+        // self.cache_long_term_lt_eq_version(&object_id, version_bound, &obj);
         obj
     }
 
@@ -345,15 +345,15 @@ impl ReadonlyCacheInvalidator for ReadonlyWritebackCache {
     fn invalidate_objects(&self, object_ids: &[ObjectID]) -> SuiResult {
         object_ids.iter().for_each(|id| {
             self.obj_cache.invalidate(id);
-            self.obj_lt_eq_version.invalidate(id);
-            self.obj_by_key.invalidate(id);
+            // self.obj_lt_eq_version.invalidate(id);
+            // self.obj_by_key.invalidate(id);
         });
         Ok(())
     }
 
     fn invalidate_all_objects(&self) -> SuiResult {
-        self.obj_by_key.invalidate_all();
-        self.obj_lt_eq_version.invalidate_all();
+        // self.obj_by_key.invalidate_all();
+        // self.obj_lt_eq_version.invalidate_all();
         self.obj_cache.invalidate_all();
         Ok(())
     }
