@@ -104,7 +104,7 @@ pub mod writeback_cache_tests;
 mod notify_read_input_objects_tests;
 
 #[derive(Clone, PartialEq, Eq)]
-enum ObjectEntry {
+pub enum ObjectEntry {
     Object(Object),
     Deleted,
     Wrapped,
@@ -119,7 +119,7 @@ impl ObjectEntry {
         }
     }
 
-    fn is_tombstone(&self) -> bool {
+    pub fn is_tombstone(&self) -> bool {
         match self {
             ObjectEntry::Deleted | ObjectEntry::Wrapped => true,
             ObjectEntry::Object(_) => false,
@@ -163,7 +163,7 @@ impl From<ObjectOrTombstone> for ObjectEntry {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum LatestObjectCacheEntry {
+pub enum LatestObjectCacheEntry {
     Object(SequenceNumber, ObjectEntry),
     NonExistent,
 }

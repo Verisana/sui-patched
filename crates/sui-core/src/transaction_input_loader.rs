@@ -21,7 +21,7 @@ use sui_types::{
 };
 use tracing::instrument;
 
-pub(crate) struct TransactionInputLoader {
+pub struct TransactionInputLoader {
     cache: Arc<dyn ObjectCacheRead>,
 }
 
