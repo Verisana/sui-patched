@@ -41,6 +41,7 @@ pub fn executor(
 }
 
 pub use move_vm_runtime_latest::move_vm::MoveVM;
+pub use sui_adapter_latest::adapter::new_native_extensions;
 pub fn vm_runtime(protocol_config: &ProtocolConfig) -> SuiResult<Arc<MoveVM>> {
     Ok(Arc::new(sui_adapter_latest::adapter::new_move_vm(
         sui_move_natives_latest::all_natives(false, protocol_config),
