@@ -38,7 +38,7 @@ use crate::executor;
 use crate::verifier;
 use sui_adapter_latest::execution_mode;
 
-pub struct Executor(pub Arc<MoveVM>);
+pub(crate) struct Executor(Arc<MoveVM>);
 
 pub(crate) struct Verifier<'m> {
     config: VerifierConfig,
